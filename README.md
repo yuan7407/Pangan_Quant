@@ -1,6 +1,8 @@
 # Quantitative Trading Project
 
-本项目为量化交易策略开发与回测平台，包含多版本策略、回测日志、工具脚本等。
+本项目为两个本人在用的量化策略：
+1. 针对ETF类型的长期低风险控制回撤策略，比如QQQ胜率能到达70%的量化程序。
+2. 针对热门股票的短期高风险高爆发的股票的量化策略，比如NVDA/TSLA/PLTR等。
 
 ## 目录结构
 - `src/strategy/` 策略相关代码
@@ -8,7 +10,6 @@
 - `src/utils/` 工具脚本
 - `logs/` 回测日志与输出
 - `docs/` 项目文档
-- `notebooks/` Jupyter分析与可视化
 
 ## 快速开始
 1. 安装依赖：`pip install -r requirements.txt`
