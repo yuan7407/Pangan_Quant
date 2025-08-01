@@ -64,7 +64,7 @@ class TradingParameters:
     risk_pct_per_trade: float = 0.40  # 从0.30提高到0.40
     max_daily_loss: float = 0.50      # 从0.40提高到0.50
     max_drawdown: float = 0.80        # 从0.70提高到0.80
-    trade_loss_pct: float = 0.25      # 从0.15提高到0.25（允许-25%回撤）
+    trade_loss_pct: float = 0.12      # 从0.25降到0.12（12%止损更合理）
     equity_risk: float = 0.3
     min_bars_between_trades: int = 0
 
@@ -74,8 +74,8 @@ class TradingParameters:
     min_position_size: int = 100      # 从10提到100
 
     # 获利了结参数
-    profit_trigger_1: float = 0.60    # 从0.40提高到0.60
-    profit_trigger_2: float = 1.20    # 从0.80提高到1.20
+    profit_trigger_1: float = 0.20    # 从0.60降到0.20（20%就部分止盈）
+    profit_trigger_2: float = 0.40    # 从1.20降到0.40（40%再次止盈）
 
     # 止损参数
     stop_atr: float = 5.0             # 从4.0提高到5.0
@@ -106,7 +106,7 @@ class TradingParameters:
     downtrend_mult: float = 0.7
 
     # 重新定义追踪止损参数的语义：直接设定合理的激活阈值
-    trailing_activation_base: float = 0.10  # 从0.05提高到0.10
+    trailing_activation_base: float = 0.08  # 从0.10降到0.08（8%激活追踪）
     trailing_strong_uptrend_mult: float = 2.5
     trailing_uptrend_mult: float = 2.0
     trailing_sideways_mult: float = 2.5
@@ -121,7 +121,7 @@ class TradingParameters:
 
     # 额外参数
 
-    batches_allowed: int = 10
+    batches_allowed: int = 5          # 从10降到5（减少过度加仓）
 
     lookback_days_for_dip: int = 20  # 回调检查的回望天数
     min_bars_after_add: int = 3  # 加仓后最小间隔天数
@@ -813,48 +813,44 @@ class MarketState:
             return 1.0
 
     def get_buy_signal(self) -> bool:
-        """激进但更精准的买入信号"""
+        """平衡版买入信号 - 保留4个条件但优化触发频率"""
         if len(self.strategy.data.close) < 10:
             return False
 
         current_price = self.strategy.data.close[0]
 
-        # 新增：检查是否处于超卖后的反弹
-        rsi_oversold_bounce = False
-        if self.strategy.rsi[0] > 30 and self.strategy.rsi[-1] < 30:
-            rsi_oversold_bounce = True
-            self.strategy.log("RSI超卖反弹信号", level="CRITICAL")
-
-        # 条件1：强势突破（提高标准）
+        # 条件1：强势突破（保持3%要求）
         if len(self.strategy.data.high) >= 10:
             recent_high = max(self.strategy.data.high.get(size=10)[:-1])
-            if current_price > recent_high * 1.02:  # 需要突破2%以上
-                self.strategy.log(f"强势突破信号 - 突破{(current_price/recent_high-1)*100:.1f}%", level="CRITICAL")
+            if current_price > recent_high * 1.03 and self.strategy.data.volume[0] > self.strategy.volume_ma[0] * 1.5:
+                self.strategy.log(f"强势突破信号 - 突破{(current_price/recent_high-1)*100:.1f}%+放量", level="CRITICAL")
                 return True
 
-        # 条件2：MACD金叉+动量确认
+        # 条件2：MACD金叉（降低要求）
         if (self.strategy.macd.macd[-1] <= self.strategy.macd.signal[-1] and
             self.strategy.macd.macd[0] > self.strategy.macd.signal[0]):
-            # 额外检查：MACD必须在零轴上方或即将突破
-            if self.strategy.macd.macd[0] > 0 or self.strategy.macd.macd[0] > self.strategy.macd.macd[-1] * 1.2:
-                self.strategy.log("MACD金叉+动量确认", level="CRITICAL")
+            # 放宽条件：MACD接近零轴或RSI>45即可
+            if self.strategy.macd.macd[0] > -0.5 or self.strategy.rsi[0] > 45:
+                self.strategy.log("MACD金叉确认", level="CRITICAL")
                 return True
 
-        # 条件3：强势反弹（提高门槛）
+        # 条件3：强势反弹（降低门槛到3%）
         if len(self.strategy.data.close) >= 5:
             recent_low = min(self.strategy.data.low.get(size=5))
             bounce = (current_price / recent_low - 1)
-            # 需要5%反弹+RSI支持+成交量确认
-            if bounce > 0.05 and self.strategy.rsi[0] > 45:
-                volume_surge = self.strategy.data.volume[0] > self.strategy.volume_ma[0] * 1.5
+            if bounce > 0.03 and self.strategy.rsi[0] > 40:  # 从5%降到3%，RSI从45降到40
+                volume_surge = self.strategy.data.volume[0] > self.strategy.volume_ma[0] * 1.2  # 从1.5降到1.2
                 if volume_surge:
                     self.strategy.log(f"强势反弹确认 - 反弹{bounce*100:.1f}%+放量", level="CRITICAL")
                     return True
 
-        # 条件4：RSI超卖反弹
-        if rsi_oversold_bounce and current_price > self.strategy.ma_fast[0]:
-            self.strategy.log("RSI超卖反弹+价格站上均线", level="CRITICAL")
-            return True
+        # 条件4：RSI超卖反弹（保留原逻辑）
+        rsi_oversold_bounce = False
+        if self.strategy.rsi[0] > 35 and self.strategy.rsi[-1] < 35:  # 从30提高到35
+            rsi_oversold_bounce = True
+            if current_price > self.strategy.ma_fast[0] * 0.98:  # 允许略低于均线
+                self.strategy.log("RSI超卖反弹+接近均线", level="CRITICAL")
+                return True
 
         return False
 
@@ -1434,71 +1430,75 @@ class StopManager:
             return False
 
     def _check_trailing_stop(self, current_price, market_regime):
-        """优化的追踪止损 - 更灵活的触发条件"""
+        """修复版追踪止损 - 避免过度敏感"""
         try:
-            if not hasattr(self, 'trading_params') or self.trading_params is None:
-                raise ValueError("追踪止损: trading_params未设置")
-
-            # 获取所有相关参数
-            trail_stop_mult = ParamAccessor.get_param(self, 'trail_stop_mult')
-            trailing_activation_base = ParamAccessor.get_param(self, 'trailing_activation_base')
-            trailing_stop_min_profit = ParamAccessor.get_param(self, 'trailing_stop_min_profit')
-            trailing_stop_min_drop = ParamAccessor.get_param(self, 'trailing_stop_min_drop')
-
-            # 基本条件检查
-            if not self.strategy.position or not hasattr(self.strategy, 'entry_price') or self.strategy.entry_price == 0:
+            if not self.strategy.position or not hasattr(self.strategy, 'entry_price'):
                 return False
-
+            
             profit_pct = (current_price / self.strategy.entry_price) - 1
             holding_days = self.strategy.get_holding_days()
-
-            # ===== 改进的激活逻辑 =====
+            
+            # 激活追踪止损
             if not self.trailing_activated:
-                # 动态激活阈值（基于持仓时间和市场状态）
-                base_threshold = trailing_activation_base
-
-                # 持仓时间调整
-                if holding_days > 60:
-                    base_threshold *= 0.8  # 长期持仓降低激活门槛
-                elif holding_days > 30:
-                    base_threshold *= 0.9
-
-                # 市场状态调整
+                # 高风险策略：提高激活门槛
                 if market_regime == "strong_uptrend":
-                    base_threshold *= 1.2  # 强势市场提高门槛
-                elif market_regime == "downtrend":
-                    base_threshold *= 0.8  # 弱势市场降低门槛
-
-                if profit_pct > base_threshold:
+                    activation_threshold = 0.25  # 25%激活（原15%太低）
+                elif market_regime == "uptrend":
+                    activation_threshold = 0.20  # 20%激活
+                else:
+                    activation_threshold = 0.15  # 15%激活
+                
+                if profit_pct > activation_threshold:
                     self.trailing_activated = True
                     self.highest_profit = profit_pct
-                    self.strategy.log(f"追踪止损已激活 - 当前盈利: {profit_pct:.2%}", level='INFO')
+                    # 关键修复：正确初始化最高价
+                    self.highest_price = current_price
+                    self.strategy.log(
+                        f"追踪止损激活 - 盈利{profit_pct:.1%}，最高价{self.highest_price:.2f}",
+                        level="INFO"
+                    )
                     return False
-
-                return False
-
-            # ===== 已激活的追踪止损逻辑 =====
-            self.highest_profit = max(self.highest_profit, profit_pct)
-
-            # 计算回撤
-            high_since_entry = getattr(self.strategy, 'high_since_entry', self.strategy.data.high[0])
-            drop_from_peak = (high_since_entry - current_price) / high_since_entry
-
-            # 动态回撤容忍度
-            if self.highest_profit > 1.0:  # 盈利100%以上
-                max_allowed_drop = 0.25  # 允许25%回撤
-            elif self.highest_profit > 0.5:  # 盈利50%以上
-                max_allowed_drop = 0.20  # 允许20%回撤
-            elif self.highest_profit > 0.3:  # 盈利30%以上
-                max_allowed_drop = 0.15  # 允许15%回撤
+                else:
+                    # 未激活时不检查止损
+                    return False
+            
+            # 更新最高点
+            if current_price > self.highest_price:
+                self.highest_price = current_price
+                self.highest_profit = (self.highest_price / self.strategy.entry_price) - 1
+            
+            # 计算从最高点的回撤
+            drawdown_from_high = (self.highest_price - current_price) / self.highest_price
+            
+            # 高风险策略的动态止损线（更宽松）
+            if self.highest_profit > 1.0:  # 盈利超过100%
+                max_drawdown = 0.30  # 允许30%回撤（原25%）
+            elif self.highest_profit > 0.5:  # 盈利超过50%
+                max_drawdown = 0.25  # 允许25%回撤（原20%）
+            elif self.highest_profit > 0.30:  # 盈利超过30%
+                max_drawdown = 0.20  # 允许20%回撤（原15%）
             else:
-                max_allowed_drop = 0.12  # 允许12%回撤
-
+                # 盈利较低时完全不用追踪止损
+                return False
+            
+            # 额外保护：持仓时间越长，允许的回撤越大
+            if holding_days > 60:
+                max_drawdown *= 1.2
+            
+            # 检查是否触发止损
+            if drawdown_from_high > max_drawdown:
+                self.strategy.log(
+                    f"追踪止损触发 - 最高价{self.highest_price:.2f}，当前价{current_price:.2f}，"
+                    f"最高盈利{self.highest_profit:.1%}，回撤{drawdown_from_high:.1%} > {max_drawdown:.1%}",
+                    level="CRITICAL"
+                )
+                return True
+            
             return False
-
+            
         except Exception as e:
             self.strategy.log(f"追踪止损错误: {str(e)}")
-            raise
+            return False
 
     def check_all_stops(self):
         """统一的止损检查 - 带优先级"""
@@ -1579,7 +1579,6 @@ class StopManager:
 
 class PositionManager:
     """头寸管理器"""
-
     def __init__(self, params):
         self.trading_params = params
         self.strategy = None  # 将在之后设置
@@ -1692,7 +1691,6 @@ class PositionManager:
             return True
         return False
 
-    # 修改_clean_expired_buy_history方法（简化但保留）
     def _clean_expired_buy_history(self):
         """清理过期的买入价格历史"""
         if not self._buy_price_history:
@@ -1776,7 +1774,6 @@ class PositionManager:
                 }
         return None
 
-    # 位置：PositionManager类，约第2600行
     def _check_add_position(self, current_price, market_regime):
         """检查是否应该加仓 - 优化版，保留所有原有逻辑"""
         # 获取趋势强度
@@ -1959,44 +1956,6 @@ class PositionManager:
                     }
         return None
 
-    def _check_sideways_reduction(self, market_regime, holding_days, profit_pct,
-                                 current_position_size, min_meaningful_trade,
-                                 current_day, passive_mode):
-        """检查横盘市场减仓"""
-        if not passive_mode:
-            if market_regime == "sideways" and holding_days > 90:
-                # 使用 is_long_term_sideways 方法
-                if self.strategy.market_state.is_long_term_sideways(window=30, range_threshold=0.04):
-                    if profit_pct > 0.03:
-                        sell_size = max(int(current_position_size * 0.5), min_meaningful_trade)
-                        sell_size = min(sell_size, current_position_size)
-
-                        if sell_size >= min_meaningful_trade:
-                            self._last_sell_day = current_day
-                            return {
-                                'action': 'sell',
-                                'size': sell_size,
-                                'reason': f"Sideways market optimization"
-                            }
-        return None
-
-    def _check_long_term_review(self, holding_days, profit_pct, current_position_size,
-                               min_meaningful_trade, current_day):
-        """超长期仓位回顾"""
-        if holding_days % 90 == 0 and holding_days >= 180:
-            if profit_pct < 0.10:
-                sell_size = max(int(current_position_size * 0.33), min_meaningful_trade)
-                sell_size = min(sell_size, current_position_size)
-
-                if sell_size >= min_meaningful_trade:
-                    self._last_sell_day = current_day
-                    return {
-                        'action': 'sell',
-                        'size': sell_size,
-                        'reason': f"Long-term position review"
-                    }
-        return None
-
     def _get_position_info(self):
         """获取当前仓位信息 - 统一计算，避免重复"""
         current_price = self.strategy.data.close[0]
@@ -2132,14 +2091,25 @@ class PositionManager:
             else:
                 effective_protection_days = new_position_protection_days
 
-            # 8. 获利检查
-            profit_taking_result = self._check_profit_taking(
-                profit_pct, passive_mode, min_meaningful_trade,
-                current_position_size, current_day
-            )
-            if profit_taking_result:
-                self.strategy.log(f"获利止盈 - 规模: {profit_taking_result['size']}股, 利润: {profit_pct:.2%}", level="INFO")
-                return profit_taking_result
+            # 8. 获利检查 - 确保这部分代码存在且条件正确
+            if self.strategy.position and current_position_size > 0 and profit_pct > 0:  # 添加盈利检查
+                # 强制启用获利检查，忽略passive_mode
+                take_profit_size = self._check_enhanced_profit_levels(profit_pct)
+                
+                if take_profit_size > 0:
+                    # 确保卖出规模有意义
+                    take_profit_size = max(take_profit_size, min_meaningful_trade)
+                    take_profit_size = min(take_profit_size, current_position_size)
+                    
+                    if take_profit_size >= min_meaningful_trade:
+                        self._last_sell_day = current_day
+                        result = {
+                            'action': 'sell',
+                            'size': take_profit_size,
+                            'reason': f'Take profit at {profit_pct:.1%}'
+                        }
+                        self.strategy.log(f"获利止盈决策 - {result['reason']}, 数量: {take_profit_size}", level="CRITICAL")
+                        return result
 
             # 9. 止损检查
             stop_loss_result = self._check_stop_loss(
@@ -2150,30 +2120,6 @@ class PositionManager:
                 self.strategy.log(f"智能止损 - 规模: {stop_loss_result['size']}股, 亏损: {profit_pct:.2%}", level="INFO")
                 return stop_loss_result
 
-            # 10. 横盘市场减仓
-            sideways_result = self._check_sideways_reduction(
-                market_regime, holding_days, profit_pct, current_position_size,
-                min_meaningful_trade, current_day, passive_mode
-            )
-            if sideways_result:
-                self.strategy.log(
-                    f"横盘市场优化 - 规模: {sideways_result['size']}股, 持有{holding_days}天, 利润: {profit_pct:.2%}",
-                    level="INFO"
-                )
-                return sideways_result
-
-            # 11. 超长期仓位回顾
-            long_term_result = self._check_long_term_review(
-                holding_days, profit_pct, current_position_size,
-                min_meaningful_trade, current_day
-            )
-            if long_term_result:
-                self.strategy.log(
-                    f"长期仓位评估 - 规模: {long_term_result['size']}股, 持有{holding_days}天, 利润不足: {profit_pct:.2%}",
-                    level="INFO"
-                )
-                return long_term_result
-
             return result
 
         except Exception as e:
@@ -2181,46 +2127,28 @@ class PositionManager:
             raise
 
     def _check_enhanced_profit_levels(self, profit_pct):
-        """高风险高回报的止盈策略 - 让利润充分奔跑"""
-
-        # 大幅提高止盈门槛到50%（原25%）
-        if profit_pct < 0.50:
+        """调整止盈策略 - 让利润奔跑"""
+        self.strategy.log(f"检查止盈 - 当前盈利: {profit_pct:.1%}", level="INFO")
+        
+        if profit_pct < 0.25:  # 从15%提高到25%
             return 0
 
         current_position_size = self.strategy.position.size
-        holding_days = self.strategy.get_holding_days()
+        
+        # 更激进的止盈策略
+        if profit_pct > 1.00:  # 100%以上
+            return int(current_position_size * 0.30)  # 只卖30%
+        elif profit_pct > 0.60:  # 60%以上
+            return int(current_position_size * 0.20)  # 只卖20%
+        elif profit_pct > 0.40:  # 40%以上
+            return int(current_position_size * 0.15)  # 只卖15%
+        elif profit_pct > 0.25:  # 25%以上
+            # 只在趋势破坏时卖出
+            if self.strategy.ma_fast[0] < self.strategy.ma_slow[0]:
+                return int(current_position_size * 0.10)
+        
+        return 0
 
-        # 评估趋势是否仍然强劲
-        trend_intact = True
-
-        # 检查关键技术指标
-        if self.strategy.ma_fast[0] < self.strategy.ma_slow[0]:
-            trend_intact = False
-        if self.strategy.data.close[0] < self.strategy.ma_fast[0]:
-            trend_intact = False
-        if self.strategy.macd.macd[0] < self.strategy.macd.signal[0]:
-            trend_intact = False
-
-        # 根据趋势状态决定止盈策略
-        if trend_intact:
-            # 趋势完好：只有超过100%才考虑部分止盈
-            if profit_pct > 1.00:
-                return int(current_position_size * 0.25)  # 只卖25%
-            elif profit_pct > 0.80:
-                return int(current_position_size * 0.15)  # 只卖15%
-            else:
-                return 0  # 继续持有
-        else:
-            # 趋势破坏：根据盈利水平逐步止盈
-            if profit_pct > 0.80:
-                return int(current_position_size * 0.50)
-            elif profit_pct > 0.60:
-                return int(current_position_size * 0.33)
-            else:
-                return int(current_position_size * 0.20)
-
-    # 在PositionManager类中修改_update_position_cache函数
-    #@track_method(category="仓位管理方法")
     def _update_position_cache(self, current_price, market_regime, trend_strength):
         """Update internal cache for position info."""
         current_bar = len(self.strategy.data)
@@ -5134,8 +5062,8 @@ def twelvedata_download(symbol: str, start: str, end: str, interval: str = "1d",
 
         # 如果没有提供API密钥，使用demo key
         if not api_key or api_key == "4e06770f76fe42b9bc3b6760b14118f6":
-            print("⚠️  使用Twelve Data demo密钥，功能有限")
-            api_key = "demo"
+            print("使用Twelve Data demo密钥，功能有限")
+            api_key = "4e06770f76fe42b9bc3b6760b14118f6"
 
         # Twelve Data API基础URL
         base_url = "https://api.twelvedata.com/time_series"
@@ -5201,7 +5129,6 @@ def twelvedata_download(symbol: str, start: str, end: str, interval: str = "1d",
     except Exception as e:
         print(f"Twelve Data数据获取失败: {str(e)}")
         raise e
-
 
 def yahoo_direct_download(symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
     """
@@ -5325,6 +5252,52 @@ class SimpleTradingMonitor:
                 "监控已结束"
             )
 
+    def _send_startup_notification(self):
+        """发送启动通知"""
+        if self.notifier and self.is_running:
+            startup_msg = f"""
+    🚀 量化交易系统启动
+    ━━━━━━━━━━━━━━━
+    📊 标的: {self.strategy_params.symbol}
+    💰 初始资金: ${self.strategy_params.initial_cash:,.0f}
+    ⏰ 启动时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}
+    📈 策略类型: 高风险高回报
+    ━━━━━━━━━━━━━━━
+    系统开始实时监控...
+    """
+            self.notifier.send_message("交易系统启动", startup_msg)
+
+    def _send_daily_summary(self):
+        """每日收盘后发送总结"""
+        if not self.notifier or not hasattr(self.strategy, 'broker'):
+            return
+        
+        try:
+            portfolio_value = self.strategy.broker.getvalue()
+            cash = self.strategy.broker.get_cash()
+            position = self.strategy.position.size if self.strategy.position else 0
+            
+            # 计算当日盈亏
+            daily_pnl = portfolio_value - getattr(self, '_last_portfolio_value', portfolio_value)
+            daily_pnl_pct = daily_pnl / getattr(self, '_last_portfolio_value', portfolio_value) * 100
+            
+            summary_msg = f"""
+    📊 每日交易总结
+    ━━━━━━━━━━━━━━━
+    📅 日期: {datetime.datetime.now().strftime('%Y-%m-%d')}
+    💼 账户价值: ${portfolio_value:,.2f}
+    💵 可用现金: ${cash:,.2f}
+    📈 持仓数量: {position}股
+    ━━━━━━━━━━━━━━━
+    📊 当日盈亏: ${daily_pnl:+,.2f} ({daily_pnl_pct:+.1f}%)
+    ━━━━━━━━━━━━━━━
+    """
+            self.notifier.send_message("每日交易总结", summary_msg)
+            self._last_portfolio_value = portfolio_value
+            
+        except Exception as e:
+            print(f"发送每日总结失败: {str(e)}")
+
     def _monitor_loop(self):
         """监控循环"""
         check_interval = 30
@@ -5332,6 +5305,10 @@ class SimpleTradingMonitor:
         error_count = 0  # 添加错误计数器
         max_errors = 3   # 最大错误次数
 
+        # 启动时发送通知
+        self._send_startup_notification()
+        self._last_portfolio_value = self.strategy.broker.getvalue() if hasattr(self, 'strategy') else 0
+        
         while self.is_running:
             try:
                 now = datetime.datetime.now()
@@ -5603,6 +5580,13 @@ def main():
                     end=trading_params.end_date,
                     interval=interval_input
                 )),
+                ("Twelve Data", lambda: twelvedata_download(
+                    symbol=trading_params.symbol,
+                    start=trading_params.start_date,
+                    end=trading_params.end_date,
+                    interval=interval_input,
+                    api_key='4e06770f76fe42b9bc3b6760b14118f6'
+                )),
                 ("Alpha Vantage", lambda: alphavantage_download(
                     symbol=trading_params.symbol,
                     start=trading_params.start_date,
@@ -5610,13 +5594,6 @@ def main():
                     interval=interval_input,
                     prepost=include_prepost,
                     api_key=ALPHA_VANTAGE_API_KEY
-                )),
-                ("Twelve Data", lambda: twelvedata_download(
-                    symbol=trading_params.symbol,
-                    start=trading_params.start_date,
-                    end=trading_params.end_date,
-                    interval=interval_input,
-                    api_key=TWELVE_DATA_API_KEY
                 )),
                 ("Yahoo Direct", lambda: yahoo_direct_download(
                     symbol=trading_params.symbol,
@@ -5675,6 +5652,13 @@ def main():
                     end=trading_params.end_date,
                     interval=interval_input
                 )),
+                ("Twelve Data", lambda: twelvedata_download(
+                    symbol=trading_params.symbol,
+                    start=trading_params.start_date,
+                    end=trading_params.end_date,
+                    interval=interval_input,
+                    api_key='4e06770f76fe42b9bc3b6760b14118f6'
+                )),
                 ("Alpha Vantage", lambda: alphavantage_download(
                     symbol=trading_params.symbol,
                     start=trading_params.start_date,
@@ -5682,13 +5666,6 @@ def main():
                     interval=interval_input,
                     prepost=include_prepost,
                     api_key=ALPHA_VANTAGE_API_KEY
-                )),
-                ("Twelve Data", lambda: twelvedata_download(
-                    symbol=trading_params.symbol,
-                    start=trading_params.start_date,
-                    end=trading_params.end_date,
-                    interval=interval_input,
-                    api_key=TWELVE_DATA_API_KEY
                 )),
                 ("Yahoo Direct", lambda: yahoo_direct_download(
                     symbol=trading_params.symbol,
@@ -6217,7 +6194,6 @@ def main():
                 "系统错误",
                 f"错误信息: {str(e)}"
             )
-
 
 if __name__ == "__main__":
     main()
