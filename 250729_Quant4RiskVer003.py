@@ -519,7 +519,9 @@ class TradeManager:
             self._last_update = len(self.executed_trades)
 
         except Exception as e:
+            import traceback
             self.log(f"更新统计失败: {str(e)}")
+            traceback.print_exc()
             raise  # 让错误暴露出来，而不是静默返回0
 
     def add_trade(self, trade: Dict) -> None:
@@ -604,11 +606,11 @@ class TradeManager:
             self._update_statistics(trade_copy)
 
         except Exception as e:
-           if self.strategy:
-               self.strategy.log(f"添加交易记录时出现错误: {str(e)}", level='ERROR')
-           else:
-               print(f"添加交易记录时出现错误: {str(e)}")
-           raise
+            if self.strategy:
+                self.strategy.log(f"添加交易记录时出现错误: {str(e)}", level='ERROR')
+            else:
+                print(f"添加交易记录时出现错误: {str(e)}")
+            raise
 
     def update_portfolio_value(self, value: float) -> None:
         """更新投资组合价值"""
@@ -1282,7 +1284,9 @@ class RiskManager:
             return False
 
         except Exception as e:
+            import traceback
             self.strategy.log(f"风险检查错误: {str(e)}")
+            traceback.print_exc()
             # 出错时默认不限制交易，避免因错误导致无法交易
             return False
 
@@ -1316,7 +1320,9 @@ class RiskManager:
                     self.strategy.log(f"ATR获取失败，跳过波动率更新", level="WARNING")
 
         except Exception as e:
+            import traceback
             self.strategy.log(f"Tracking update error: {str(e)}")
+            traceback.print_exc()
             raise
 
     def check_stops(self):
