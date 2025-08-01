@@ -813,45 +813,62 @@ class MarketState:
             return 1.0
 
     def get_buy_signal(self) -> bool:
-        """平衡版买入信号 - 保留4个条件但优化触发频率"""
+        """激进买入信号 - 增加触发频率（修正版）"""
         if len(self.strategy.data.close) < 10:
             return False
 
         current_price = self.strategy.data.close[0]
-
-        # 条件1：强势突破（保持3%要求）
+        
+        # 条件1：突破信号（降低到2%）
         if len(self.strategy.data.high) >= 10:
             recent_high = max(self.strategy.data.high.get(size=10)[:-1])
-            if current_price > recent_high * 1.03 and self.strategy.data.volume[0] > self.strategy.volume_ma[0] * 1.5:
-                self.strategy.log(f"强势突破信号 - 突破{(current_price/recent_high-1)*100:.1f}%+放量", level="CRITICAL")
+            if recent_high > 0 and current_price > recent_high * 1.02:
+                self.strategy.log(f"突破信号 - 突破{(current_price/recent_high-1)*100:.1f}%", level="CRITICAL")
                 return True
-
-        # 条件2：MACD金叉（降低要求）
-        if (self.strategy.macd.macd[-1] <= self.strategy.macd.signal[-1] and
-            self.strategy.macd.macd[0] > self.strategy.macd.signal[0]):
-            # 放宽条件：MACD接近零轴或RSI>45即可
-            if self.strategy.macd.macd[0] > -0.5 or self.strategy.rsi[0] > 45:
-                self.strategy.log("MACD金叉确认", level="CRITICAL")
+        
+        # 条件2：MACD金叉（更宽松）
+        if hasattr(self.strategy, 'macd') and len(self.strategy.macd) > 1:
+            if (self.strategy.macd.macd[-1] <= self.strategy.macd.signal[-1] and
+                self.strategy.macd.macd[0] > self.strategy.macd.signal[0]):
+                self.strategy.log("MACD金叉", level="CRITICAL")
                 return True
-
-        # 条件3：强势反弹（降低门槛到3%）
+        
+        # 条件3：动量反转（新增）
+        if len(self.strategy.data.close) >= 3:
+            # 连续下跌后反转
+            if (self.strategy.data.close[-3] > self.strategy.data.close[-2] > self.strategy.data.close[-1] and
+                self.strategy.data.close[0] > self.strategy.data.close[-1] * 1.01):
+                if hasattr(self.strategy, 'rsi') and self.strategy.rsi[0] < 70:
+                    self.strategy.log("动量反转信号", level="CRITICAL")
+                    return True
+        
+        # 条件4：均线支撑买入（修正：添加安全检查）
+        if hasattr(self.strategy, 'ma_fast') and len(self.strategy.ma_fast) > 0:
+            ma_fast_value = self.strategy.ma_fast[0]
+            if ma_fast_value > 0:  # 确保均线有效
+                price_distance = abs(current_price - ma_fast_value) / ma_fast_value
+                if price_distance < 0.02:  # 价格接近均线2%以内
+                    if hasattr(self.strategy, 'ma_slow') and len(self.strategy.ma_slow) > 0:
+                        if self.strategy.ma_fast[0] > self.strategy.ma_slow[0]:
+                            self.strategy.log("均线支撑买入", level="CRITICAL")
+                            return True
+        
+        # 条件5：RSI超卖（保持原有但更宽松）
+        if hasattr(self.strategy, 'rsi') and len(self.strategy.rsi) > 1:
+            if self.strategy.rsi[0] > 30 and self.strategy.rsi[-1] < 30:
+                self.strategy.log("RSI超卖反弹", level="CRITICAL")
+                return True
+        
+        # 条件6：强势反弹（保留原有条件）
         if len(self.strategy.data.close) >= 5:
             recent_low = min(self.strategy.data.low.get(size=5))
-            bounce = (current_price / recent_low - 1)
-            if bounce > 0.03 and self.strategy.rsi[0] > 40:  # 从5%降到3%，RSI从45降到40
-                volume_surge = self.strategy.data.volume[0] > self.strategy.volume_ma[0] * 1.2  # 从1.5降到1.2
-                if volume_surge:
-                    self.strategy.log(f"强势反弹确认 - 反弹{bounce*100:.1f}%+放量", level="CRITICAL")
-                    return True
-
-        # 条件4：RSI超卖反弹（保留原逻辑）
-        rsi_oversold_bounce = False
-        if self.strategy.rsi[0] > 35 and self.strategy.rsi[-1] < 35:  # 从30提高到35
-            rsi_oversold_bounce = True
-            if current_price > self.strategy.ma_fast[0] * 0.98:  # 允许略低于均线
-                self.strategy.log("RSI超卖反弹+接近均线", level="CRITICAL")
-                return True
-
+            if recent_low > 0:
+                bounce = (current_price / recent_low - 1)
+                if bounce > 0.03 and hasattr(self.strategy, 'rsi') and self.strategy.rsi[0] > 40:
+                    if hasattr(self.strategy, 'volume_ma') and self.strategy.data.volume[0] > self.strategy.volume_ma[0] * 1.2:
+                        self.strategy.log(f"强势反弹确认 - 反弹{bounce*100:.1f}%+放量", level="CRITICAL")
+                        return True
+        
         return False
 
     def get_market_regime(self, force_update=False):
@@ -2127,25 +2144,43 @@ class PositionManager:
             raise
 
     def _check_enhanced_profit_levels(self, profit_pct):
-        """调整止盈策略 - 让利润奔跑"""
-        self.strategy.log(f"检查止盈 - 当前盈利: {profit_pct:.1%}", level="INFO")
+        """高风险高回报止盈 - 只在极端情况止盈"""
         
-        if profit_pct < 0.25:  # 从15%提高到25%
+        # 大幅提高门槛：低于50%不考虑止盈
+        if profit_pct < 0.50:
             return 0
-
+        
         current_position_size = self.strategy.position.size
         
-        # 更激进的止盈策略
-        if profit_pct > 1.00:  # 100%以上
-            return int(current_position_size * 0.30)  # 只卖30%
-        elif profit_pct > 0.60:  # 60%以上
-            return int(current_position_size * 0.20)  # 只卖20%
-        elif profit_pct > 0.40:  # 40%以上
-            return int(current_position_size * 0.15)  # 只卖15%
-        elif profit_pct > 0.25:  # 25%以上
-            # 只在趋势破坏时卖出
-            if self.strategy.ma_fast[0] < self.strategy.ma_slow[0]:
-                return int(current_position_size * 0.10)
+        # 检查是否应该持有
+        should_hold = True
+        
+        # 只有在以下情况才考虑止盈：
+        # 1. 趋势明显破坏
+        if self.strategy.ma_fast[0] < self.strategy.ma_slow[0] * 0.98:
+            should_hold = False
+        
+        # 2. MACD死叉
+        if (self.strategy.macd.macd[0] < self.strategy.macd.signal[0] and
+            self.strategy.macd.macd[-1] > self.strategy.macd.signal[-1]):
+            should_hold = False
+        
+        # 3. RSI超买后回落
+        if self.strategy.rsi[0] < 70 and self.strategy.rsi[-1] > 70:
+            should_hold = False
+        
+        if should_hold:
+            return 0  # 继续持有
+        
+        # 分级止盈（但门槛很高）
+        if profit_pct > 1.50:  # 150%以上
+            return int(current_position_size * 0.50)
+        elif profit_pct > 1.00:  # 100%以上
+            return int(current_position_size * 0.33)
+        elif profit_pct > 0.70:  # 70%以上
+            return int(current_position_size * 0.25)
+        elif profit_pct > 0.50:  # 50%以上
+            return int(current_position_size * 0.20)
         
         return 0
 
@@ -2331,8 +2366,16 @@ class PositionManager:
 
             # 确保在强势市场时不会过于保守
             market_regime = self.market_state.get_market_regime()
-            if market_regime in ["strong_uptrend", "uptrend"] and final_position < 0.4:
-                final_position = max(final_position, 0.4)
+            # 激进调整
+            if market_regime in ["strong_uptrend", "uptrend"]:
+                final_position = max(final_position, 0.60)  # 趋势市场最少60%仓位
+            elif market_regime == "sideways":
+                final_position = max(final_position, 0.40)  # 横盘最少40%
+            else:
+                final_position = max(final_position, 0.30)  # 下跌最少30%
+            
+            if account_return > 0.20:
+                final_position = min(0.95, final_position * 1.3)
 
             # 记录凯利计算详情
             self.strategy.log(
@@ -5514,7 +5557,7 @@ def main():
         generate_live_report = False  # 默认值
         if live_mode:
             # 实时模式：允许用户指定历史数据长度
-            history_days_input = input("输入历史数据天数（默认3650天）: ").strip() or "3650"
+            history_days_input = input("输入历史数据天数（默认365天）: ").strip() or "365"
             history_days = int(history_days_input)
 
             end_date = datetime.datetime.now().strftime("%Y-%m-%d")
