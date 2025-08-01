@@ -1,6 +1,6 @@
-# Quantitative Trading Project
+# Michael's Quant - A Project from Trading Instinct
 
-本项目为两个本人在用的量化策略：
+"盘感"项目为两个本人在用的量化策略：
 1. 针对ETF类型的长期低风险控制回撤策略，比如QQQ胜率能到达70%的量化程序。
 2. 针对热门股票的短期高风险高爆发的股票的量化策略，比如NVDA/TSLA/PLTR等。
 
