@@ -1,4 +1,4 @@
-# Michael's Quant - A Project from Trading Instinct
+# 盘感 Quant - A Project from Trading Instinct
 
 "盘感"项目为两个本人在用的量化策略：
 1. 针对ETF类型的长期低风险控制回撤策略，比如QQQ胜率能到达70%的量化程序。
