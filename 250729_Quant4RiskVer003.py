@@ -3962,11 +3962,19 @@ class SimpleLiveDataFeed(bt.feeds.DataBase):
         self.hist_data = []
         self.hist_index = 0
         self.trading_params = None
+        self._last_valid_data = None  # 添加这行
+        self._last_dummy_time = None  # 添加这行
+        self._last_non_trading_msg = None  # 添加这行
         # 加载历史数据作为初始数据
         self._load_initial_data()
 
     def _load_initial_data(self):
         """加载初始历史数据"""
+        # 检查是否已经有数据（从外部传入）
+        if hasattr(self, 'hist_data') and self.hist_data:
+            print(f"使用外部传入的 {len(self.hist_data)} 条历史数据")
+            return
+    
         try:
             end_date = datetime.datetime.now()
             # 使用 params.history_days 动态计算起始日期
@@ -4018,16 +4026,24 @@ class SimpleLiveDataFeed(bt.feeds.DataBase):
                 if self.hist_index % 100 == 0:
                     print(f"历史数据加载进度: {self.hist_index}/{len(self.hist_data)}")
 
-                # 设置数据线 - 添加安全检查
+                # 设置数据线 - 使用更安全的方式
                 try:
+                    # 确保有足够的空间
+                    if len(self.lines.datetime) == 0:
+                        return False
+                        
                     self.lines.datetime[0] = bt.date2num(data['datetime'])
-                    self.lines.open[0] = data['open']
-                    self.lines.high[0] = data['high']
-                    self.lines.low[0] = data['low']
-                    self.lines.close[0] = data['close']
-                    self.lines.volume[0] = data['volume']
+                    self.lines.open[0] = float(data['open'])
+                    self.lines.high[0] = float(data['high'])
+                    self.lines.low[0] = float(data['low'])
+                    self.lines.close[0] = float(data['close'])
+                    self.lines.volume[0] = float(data['volume'])
                     self.lines.openinterest[0] = 0
-                except IndexError as e:
+                    
+                    # 保存最后的有效数据
+                    self._last_valid_data = data.copy()
+                    
+                except (IndexError, AttributeError) as e:
                     print(f"数据线分配错误: {str(e)}")
                     return False
 
@@ -4040,6 +4056,16 @@ class SimpleLiveDataFeed(bt.feeds.DataBase):
 
             # 检查是否需要更新实时数据
             now = datetime.datetime.now()
+            # 添加None检查
+            if self.last_update is None:
+                self.last_update = now - datetime.timedelta(seconds=61)  # 确保第一次会更新
+
+            if (now - self.last_update).seconds >= self.p.interval:
+                # 获取最新数据
+                new_data = self._fetch_current_price()
+                if new_data and self._is_trading_hours(now):
+                    self.last_update = now
+
             if self.last_update is None or (now - self.last_update).seconds >= self.p.interval:
                 # 获取最新数据
                 new_data = self._fetch_current_price()
@@ -5347,17 +5373,38 @@ class SimpleTradingMonitor:
         except Exception as e:
             print(f"发送每日总结失败: {str(e)}")
 
-    def _monitor_loop(self):
-        """监控循环"""
+    def _monitor_loop(self): 
+        # 等待策略初始化
+        init_wait_count = 0
+        while not hasattr(self, 'strategy') or self.strategy is None:
+            time.sleep(1)
+            init_wait_count += 1
+            if init_wait_count > 10:
+                print("策略初始化超时")
+                return
+        
+        # 启动时发送通知
+        try:
+            if self.notifier:
+                startup_msg = f"""
+    量化交易系统启动
+    ━━━━━━━━━━━━━━━
+    标的: {self.strategy_params.symbol}
+    初始资金: ${self.strategy_params.initial_cash:,.0f}
+    启动时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}
+    策略类型: 高风险高回报
+    ━━━━━━━━━━━━━━━
+    系统开始实时监控...
+    """
+                self.notifier.send_message("交易系统启动", startup_msg)
+        except Exception as e:
+            print(f"发送启动通知失败: {str(e)}")
+
         check_interval = 30
         last_position_check = None
         error_count = 0  # 添加错误计数器
         max_errors = 3   # 最大错误次数
 
-        # 启动时发送通知
-        self._send_startup_notification()
-        self._last_portfolio_value = self.strategy.broker.getvalue() if hasattr(self, 'strategy') else 0
-        
         while self.is_running:
             try:
                 now = datetime.datetime.now()
@@ -5618,8 +5665,31 @@ def main():
             # 实时模式：创建混合数据源
             print(f"\n创建实时数据源 {symbol}...")
 
-            # 先获取历史数据作为基础
-            print(f"下载最近30天的历史数据...")
+            # 创建实时数据源，传入已有的历史数据
+            df_feed = SimpleLiveDataFeed(
+                symbol=trading_params.symbol,
+                interval=60,
+                history_days=trading_params.history_days
+            )
+            df_feed.trading_params = trading_params
+            
+            # 将已获取的历史数据传给feed
+            if df is not None and not df.empty:
+                # 转换数据格式供SimpleLiveDataFeed使用
+                df_feed.hist_data = []
+                for idx, row in df.iterrows():
+                    df_feed.hist_data.append({
+                        'datetime': row['date'],
+                        'open': row['open'],
+                        'high': row['high'],
+                        'low': row['low'],
+                        'close': row['close'],
+                        'volume': row['volume']
+                    })
+                df_feed.hist_index = 0
+                print(f"传入 {len(df_feed.hist_data)} 条历史数据到实时数据源")
+            
+            print("实时数据源已创建")
 
             # 使用现有的多源API机制获取历史数据
             api_sources = [
