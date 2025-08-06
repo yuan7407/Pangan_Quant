@@ -64,7 +64,7 @@ class TradingParameters:
     risk_pct_per_trade: float = 0.40  # 从0.30提高到0.40
     max_daily_loss: float = 0.50      # 从0.40提高到0.50
     max_drawdown: float = 0.80        # 从0.70提高到0.80
-    trade_loss_pct: float = 0.12      # 从0.25降到0.12（12%止损更合理）
+    trade_loss_pct: float = 0.08 
     equity_risk: float = 0.3
     min_bars_between_trades: int = 0
 
@@ -74,11 +74,11 @@ class TradingParameters:
     min_position_size: int = 100      # 从10提到100
 
     # 获利了结参数
-    profit_trigger_1: float = 0.20    # 从0.60降到0.20（20%就部分止盈）
-    profit_trigger_2: float = 0.40    # 从1.20降到0.40（40%再次止盈）
+    profit_trigger_1: float = 0.08    # 从0.20降到0.08（8%就开始止盈）
+    profit_trigger_2: float = 0.15    # 从0.40降到0.15（15%第二次止盈）
 
     # 止损参数
-    stop_atr: float = 5.0             # 从4.0提高到5.0
+    stop_atr: float = 3.0
     force_min_stop_pct: float = 0.25  # 从0.15提高到0.25
     trail_stop_mult: float = 3.0
     profit_lock_pct: float = 0.5
@@ -92,8 +92,8 @@ class TradingParameters:
     position_scaling_mode: str = "kelly"  # 仓位计算模式：fixed/kelly/risk_parity
 
     # 市场状态参数
-    strong_uptrend_threshold: float = 8
-    uptrend_threshold: float = 4
+    strong_uptrend_threshold: float = 5
+    uptrend_threshold: float = 2
     sideways_threshold: float = 0.5
     downtrend_threshold: float = -9
 
@@ -116,12 +116,10 @@ class TradingParameters:
     new_position_protection_days: int = 3
 
     # 回调买入参数
-    dip_base_pct: float = 0.01
+    dip_base_pct: float = 0.005
     dip_per_batch: float = 0.005
 
-    # 额外参数
-
-    batches_allowed: int = 5          # 从10降到5（减少过度加仓）
+    batches_allowed: int = 8
 
     lookback_days_for_dip: int = 20  # 回调检查的回望天数
     min_bars_after_add: int = 3  # 加仓后最小间隔天数
@@ -821,47 +819,50 @@ class MarketState:
 
         current_price = self.strategy.data.close[0]
         try:
-            # 条件1：突破信号（降低到2%）
+            # 条件1：突破信号（降低到1.5%）
             if len(self.strategy.data.high) >= 10:
                 recent_high = max(self.strategy.data.high.get(size=10)[:-1])
-                if recent_high > 0 and current_price > recent_high * 1.02:
+                if recent_high > 0 and current_price > recent_high * 1.015:  # 从1.02降到1.015
                     self.strategy.log(f"突破信号 - 突破{(current_price/recent_high-1)*100:.1f}%", level="CRITICAL")
                     return True
             
-            # 条件2：MACD金叉（更宽松）
+            # 条件2：MACD金叉（保持原有）
             if hasattr(self.strategy, 'macd') and len(self.strategy.macd) > 1:
                 if (self.strategy.macd.macd[-1] <= self.strategy.macd.signal[-1] and
                     self.strategy.macd.macd[0] > self.strategy.macd.signal[0]):
                     self.strategy.log("MACD金叉", level="CRITICAL")
                     return True
             
-            # 条件3：动量反转（新增）
-            if len(self.strategy.data.close) >= 3:
-                # 连续下跌后反转
-                if (self.strategy.data.close[-3] > self.strategy.data.close[-2] > self.strategy.data.close[-1] and
-                    self.strategy.data.close[0] > self.strategy.data.close[-1] * 1.01):
-                    if hasattr(self.strategy, 'rsi') and self.strategy.rsi[0] < 70:
-                        self.strategy.log("动量反转信号", level="CRITICAL")
-                        return True
+            # 条件3：短期动量（新增更敏感的条件）
+            if len(self.strategy.data.close) >= 5:
+                # 5天涨幅超过3%
+                five_day_return = (current_price / self.strategy.data.close[-5] - 1)
+                if five_day_return > 0.03:
+                    self.strategy.log(f"短期动量信号 - 5天涨{five_day_return*100:.1f}%", level="CRITICAL")
+                    return True
             
-            # 条件4：均线支撑买入（修正：添加更严格的安全检查）
+            # 条件4：均线支撑买入（完整的安全检查）
             if hasattr(self.strategy, 'ma_fast') and hasattr(self.strategy, 'ma_slow'):
                 try:
                     # 确保指标有足够的数据
-                    if len(self.strategy.ma_fast) > 0 and len(self.strategy.ma_slow) > 0:
-                        # 使用get方法安全获取值，避免索引错误
-                        ma_fast_buffer = self.strategy.ma_fast.get(size=1)
-                        ma_slow_buffer = self.strategy.ma_slow.get(size=1)
+                    if (hasattr(self.strategy.ma_fast, '__len__') and 
+                        hasattr(self.strategy.ma_slow, '__len__') and
+                        len(self.strategy.ma_fast) > 0 and 
+                        len(self.strategy.ma_slow) > 0):
                         
-                        if len(ma_fast_buffer) > 0 and len(ma_slow_buffer) > 0:
-                            ma_fast_value = ma_fast_buffer[0]
-                            ma_slow_value = ma_slow_buffer[0]
+                        # 使用更安全的访问方式
+                        try:
+                            ma_fast_value = float(self.strategy.ma_fast[0])
+                            ma_slow_value = float(self.strategy.ma_slow[0])
                             
                             if ma_fast_value > 0 and ma_slow_value > 0:  # 确保均线有效
                                 price_distance = abs(current_price - ma_fast_value) / ma_fast_value
                                 if price_distance < 0.02 and ma_fast_value > ma_slow_value:
                                     self.strategy.log("均线支撑买入", level="CRITICAL")
                                     return True
+                        except (TypeError, ValueError) as e:
+                            # 数值转换失败，静默跳过
+                            pass
                 except (IndexError, AttributeError) as e:
                     # 指标还未就绪，静默跳过
                     pass
@@ -881,6 +882,24 @@ class MarketState:
                         if hasattr(self.strategy, 'volume_ma') and self.strategy.data.volume[0] > self.strategy.volume_ma[0] * 1.2:
                             self.strategy.log(f"强势反弹确认 - 反弹{bounce*100:.1f}%+放量", level="CRITICAL")
                             return True
+            
+            # 条件7：连续上涨信号（新增）
+            if len(self.strategy.data.close) >= 3:
+                if (self.strategy.data.close[0] > self.strategy.data.close[-1] and
+                    self.strategy.data.close[-1] > self.strategy.data.close[-2]):
+                    # 连续2天上涨
+                    two_day_gain = (self.strategy.data.close[0] / self.strategy.data.close[-2] - 1)
+                    if two_day_gain > 0.02:  # 2天涨2%
+                        self.strategy.log(f"连续上涨信号 - 2天涨{two_day_gain*100:.1f}%", level="CRITICAL")
+                        return True
+
+            # 条件8：成交量放大（新增）
+            if hasattr(self.strategy, 'volume_ma') and self.strategy.volume_ma[0] > 0:
+                vol_ratio = self.strategy.data.volume[0] / self.strategy.volume_ma[0]
+                if vol_ratio > 1.5 and current_price > self.strategy.data.close[-1]:
+                    self.strategy.log(f"放量上涨信号 - 成交量{vol_ratio:.1f}倍", level="CRITICAL")
+                    return True
+    
         
         except (IndexError, AttributeError) as e:
             # 某个指标访问失败，返回False
@@ -1814,134 +1833,197 @@ class PositionManager:
         return None
 
     def _check_add_position(self, current_price, market_regime):
-        """检查是否应该加仓 - 优化版，保留所有原有逻辑"""
+        """检查是否应该加仓 - 修复版"""
+        
+        # 先检查是否有持仓
+        if not self.strategy.position or self.strategy.position.size <= 0:
+            return None
+        
         # 获取趋势强度
         trend_strength = self.market_state.get_trend_strength()
-
-        # 先检查批次限制
+        
+        # 检查批次限制（但要正确处理）
         batches_allowed = ParamAccessor.get_param(self, 'batches_allowed')
         if self.added_batches >= batches_allowed:
-            # 不要静默返回，至少输出一次日志
-            if not hasattr(self, '_batch_limit_logged') or not self._batch_limit_logged:
-                self.strategy.log(f"达到最大加仓批次{batches_allowed}，停止加仓", level="CRITICAL")
-                self._batch_limit_logged = True
+            if not self._max_batches_logged:
+                self.strategy.log(f"达到最大加仓批次{batches_allowed}", level="INFO")
+                self._max_batches_logged = True
             return None
-
-        # 强趋势直接加仓
-        if trend_strength > 15 and market_regime in ["strong_uptrend", "uptrend"]:
+        
+        # 高风险策略：更激进的加仓条件
+        # 条件1：盈利5%以上就可以加仓
+        profit_pct = (current_price / self.strategy.entry_price - 1) if self.strategy.entry_price > 0 else 0
+        if profit_pct > 0.05:
+            self.strategy.log(f"盈利加仓机会 - 当前盈利{profit_pct:.1%}", level="CRITICAL")
+            
+            # 计算加仓规模
             portfolio_value = self.strategy.broker.getvalue()
             cash_available = self.strategy.broker.get_cash()
-
-            # 修改：降低现金要求，从5%降到1%
-            min_cash_required = portfolio_value * 0.01
-
-            if cash_available < min_cash_required:
-                self.strategy.log(f"现金不足：${cash_available:.2f} < ${min_cash_required:.2f}", level="INFO")
-                return None
-
-            self.strategy.log(f"强趋势加仓执行检查 - 趋势{trend_strength:.1f}，现金${cash_available:.2f}", level="DEBUG")
-
-            # 修改：使用更激进的加仓比例
-            batch_decay = ParamAccessor.get_param(self, 'position_batch_decay')
-            # 提高基础加仓比例，从0.35提高到0.5
-            add_ratio = 0.5 * (1.0 - batch_decay * self.added_batches)
-            add_ratio = max(add_ratio, 0.2)  # 从0.15提高到0.2
-
+            
+            # 使用可用现金的30%加仓
+            add_ratio = 0.3
             target_value = cash_available * add_ratio
             add_size = int(target_value / current_price)
-
-            # 降低最小加仓规模要求
-            min_add_size = max(20, int(portfolio_value * 0.02 / current_price))  # 从0.05降到0.02
-
-            if add_size < min_add_size:
-                self.strategy.log(f"加仓规模过小：{add_size} < {min_add_size}，跳过", level="INFO")
-                return None
-
-            self.strategy.log(f"强趋势加仓通过所有检查，准备执行{add_size}股", level="CRITICAL")
-
-            return {
-                'action': 'buy',
-                'size': add_size,
-                'reason': 'Strong trend following'
-            }
-
-        # 回调买入检查
-        dip_signal = self._should_buy_the_dip(current_price)
-
-        if dip_signal:
-            # 批次限制检查
-            batches_allowed = ParamAccessor.get_param(self, 'batches_allowed')
-
-            # 结合当前仓位比例进一步限制批次
-            position_ratio = self._position_cache.get('position_pct', 0)
-            if position_ratio > 0.7:
-                batches_max = batches_allowed - 2
-            elif position_ratio > 0.5:
-                batches_max = batches_allowed - 1
-            else:
-                batches_max = batches_allowed
-
-            # 如果持仓时间很长且有较大回调，允许额外加仓
-            if self.strategy.position and self.strategy.get_holding_days() > 60:
-                recent_high = max(self.strategy.data.high.get(size=20))
-                current_dip = (recent_high - current_price) / recent_high
-                if current_dip > 0.10:  # 从高点回调超过10%
-                    batches_max += 2  # 允许额外2次加仓
-                    self.strategy.log(f"大幅回调，临时增加批次限制至{batches_max}", level="INFO")
-
-            if self.added_batches >= batches_max:
-                if not hasattr(self, '_max_batches_logged') or not self._max_batches_logged:
-                    self.strategy.log(f"达到最大加仓次数: {self.added_batches}/{batches_max}", level="INFO")
-                    self._max_batches_logged = True
-                return None
-
-            # 特殊情况：长期持仓的趋势加仓
-            if self.strategy.position and self.strategy.get_holding_days() > 90:
-                current_pnl = (current_price / self.strategy.entry_price - 1)
-                if current_pnl > 0.15 and market_regime in ["uptrend", "strong_uptrend"]:
-                    # 检查是否有短期回调（不要求低于买入价）
-                    short_term_high = max(self.strategy.data.high.get(size=10))
-                    short_dip = (short_term_high - current_price) / short_term_high
-
-                    if short_dip >= 0.02:  # 从10天高点回调2%即可
-                        self.strategy.log(
-                            f"ETF趋势加仓机会 - 持仓{self.strategy.get_holding_days()}天，"
-                            f"盈利{current_pnl*100:.1f}%，短期回调{short_dip*100:.1f}%",
-                            level="INFO"
-                        )
-                        # 允许加仓，绕过严格的价格检查
-                        dip_signal = True
-
-            # 计算加仓规模
-            add_size = self._calculate_position_size()
-
-            if add_size == 0:
-                self.strategy.log("跳过加仓 - 计算的加仓规模无效", level="INFO")
-                return None
-
-            # 确保加仓规模有意义
-            portfolio_value = self.strategy.broker.getvalue()
-            portfolio_factor = max(1.0, portfolio_value / 100000)
-
-            min_meaningful_trade = max(15, int(15 * portfolio_factor))
-            add_size = max(add_size, min_meaningful_trade)
-
-            # 根据已加仓次数动态调整加仓规模
-            position_batch_decay = ParamAccessor.get_param(self, 'position_batch_decay')
-            batch_factor = max(0.5, 1.0 - (self.added_batches * position_batch_decay))
-            add_size = int(add_size * batch_factor)
-
-            if add_size >= min_meaningful_trade:
-                # 只在这里输出成功的加仓决策日志
-                self.strategy.log(f"加仓决策 - 规模: {add_size}股, 原因: {market_regime} dip buying",
-                                level="INFO")
+            
+            # 确保有意义的规模
+            if add_size >= 50:
                 return {
                     'action': 'buy',
                     'size': add_size,
-                    'reason': f'{market_regime} dip buying'
+                    'reason': f'Profit add position at {profit_pct:.1%}'
                 }
-
+        
+        # 条件2：回调3%就加仓（原来要求太高）
+        if len(self.strategy.data.high) >= 10:
+            recent_high = max(self.strategy.data.high.get(size=10))
+            dip_pct = (recent_high - current_price) / recent_high
+            
+            if dip_pct > 0.03:  # 3%回调就加仓
+                self.strategy.log(f"回调加仓机会 - 回调{dip_pct:.1%}", level="CRITICAL")
+                
+                cash_available = self.strategy.broker.get_cash()
+                add_ratio = 0.25
+                target_value = cash_available * add_ratio
+                add_size = int(target_value / current_price)
+                
+                if add_size >= 50:
+                    return {
+                        'action': 'buy', 
+                        'size': add_size,
+                        'reason': f'Dip add position at {dip_pct:.1%}'
+                    }
+        
         return None
+
+    # def _check_add_position(self, current_price, market_regime):
+    #     """检查是否应该加仓 - 优化版，保留所有原有逻辑"""
+    #     # 获取趋势强度
+    #     trend_strength = self.market_state.get_trend_strength()
+
+    #     # 先检查批次限制
+    #     batches_allowed = ParamAccessor.get_param(self, 'batches_allowed')
+    #     if self.added_batches >= batches_allowed:
+    #         # 不要静默返回，至少输出一次日志
+    #         if not hasattr(self, '_batch_limit_logged') or not self._batch_limit_logged:
+    #             self.strategy.log(f"达到最大加仓批次{batches_allowed}，停止加仓", level="CRITICAL")
+    #             self._batch_limit_logged = True
+    #         return None
+
+    #     # 强趋势直接加仓
+    #     if trend_strength > 15 and market_regime in ["strong_uptrend", "uptrend"]:
+    #         portfolio_value = self.strategy.broker.getvalue()
+    #         cash_available = self.strategy.broker.get_cash()
+
+    #         # 修改：降低现金要求，从5%降到1%
+    #         min_cash_required = portfolio_value * 0.01
+
+    #         if cash_available < min_cash_required:
+    #             self.strategy.log(f"现金不足：${cash_available:.2f} < ${min_cash_required:.2f}", level="INFO")
+    #             return None
+
+    #         self.strategy.log(f"强趋势加仓执行检查 - 趋势{trend_strength:.1f}，现金${cash_available:.2f}", level="DEBUG")
+
+    #         # 修改：使用更激进的加仓比例
+    #         batch_decay = ParamAccessor.get_param(self, 'position_batch_decay')
+    #         # 提高基础加仓比例，从0.35提高到0.5
+    #         add_ratio = 0.5 * (1.0 - batch_decay * self.added_batches)
+    #         add_ratio = max(add_ratio, 0.2)  # 从0.15提高到0.2
+
+    #         target_value = cash_available * add_ratio
+    #         add_size = int(target_value / current_price)
+
+    #         # 降低最小加仓规模要求
+    #         min_add_size = max(20, int(portfolio_value * 0.02 / current_price))  # 从0.05降到0.02
+
+    #         if add_size < min_add_size:
+    #             self.strategy.log(f"加仓规模过小：{add_size} < {min_add_size}，跳过", level="INFO")
+    #             return None
+
+    #         self.strategy.log(f"强趋势加仓通过所有检查，准备执行{add_size}股", level="CRITICAL")
+
+    #         return {
+    #             'action': 'buy',
+    #             'size': add_size,
+    #             'reason': 'Strong trend following'
+    #         }
+
+    #     # 回调买入检查
+    #     dip_signal = self._should_buy_the_dip(current_price)
+
+    #     if dip_signal:
+    #         # 批次限制检查
+    #         batches_allowed = ParamAccessor.get_param(self, 'batches_allowed')
+
+    #         # 结合当前仓位比例进一步限制批次
+    #         position_ratio = self._position_cache.get('position_pct', 0)
+    #         if position_ratio > 0.7:
+    #             batches_max = batches_allowed - 2
+    #         elif position_ratio > 0.5:
+    #             batches_max = batches_allowed - 1
+    #         else:
+    #             batches_max = batches_allowed
+
+    #         # 如果持仓时间很长且有较大回调，允许额外加仓
+    #         if self.strategy.position and self.strategy.get_holding_days() > 60:
+    #             recent_high = max(self.strategy.data.high.get(size=20))
+    #             current_dip = (recent_high - current_price) / recent_high
+    #             if current_dip > 0.10:  # 从高点回调超过10%
+    #                 batches_max += 2  # 允许额外2次加仓
+    #                 self.strategy.log(f"大幅回调，临时增加批次限制至{batches_max}", level="INFO")
+
+    #         if self.added_batches >= batches_max:
+    #             if not hasattr(self, '_max_batches_logged') or not self._max_batches_logged:
+    #                 self.strategy.log(f"达到最大加仓次数: {self.added_batches}/{batches_max}", level="INFO")
+    #                 self._max_batches_logged = True
+    #             return None
+
+    #         # 特殊情况：长期持仓的趋势加仓
+    #         if self.strategy.position and self.strategy.get_holding_days() > 90:
+    #             current_pnl = (current_price / self.strategy.entry_price - 1)
+    #             if current_pnl > 0.15 and market_regime in ["uptrend", "strong_uptrend"]:
+    #                 # 检查是否有短期回调（不要求低于买入价）
+    #                 short_term_high = max(self.strategy.data.high.get(size=10))
+    #                 short_dip = (short_term_high - current_price) / short_term_high
+
+    #                 if short_dip >= 0.02:  # 从10天高点回调2%即可
+    #                     self.strategy.log(
+    #                         f"ETF趋势加仓机会 - 持仓{self.strategy.get_holding_days()}天，"
+    #                         f"盈利{current_pnl*100:.1f}%，短期回调{short_dip*100:.1f}%",
+    #                         level="INFO"
+    #                     )
+    #                     # 允许加仓，绕过严格的价格检查
+    #                     dip_signal = True
+
+    #         # 计算加仓规模
+    #         add_size = self._calculate_position_size()
+
+    #         if add_size == 0:
+    #             self.strategy.log("跳过加仓 - 计算的加仓规模无效", level="INFO")
+    #             return None
+
+    #         # 确保加仓规模有意义
+    #         portfolio_value = self.strategy.broker.getvalue()
+    #         portfolio_factor = max(1.0, portfolio_value / 100000)
+
+    #         min_meaningful_trade = max(15, int(15 * portfolio_factor))
+    #         add_size = max(add_size, min_meaningful_trade)
+
+    #         # 根据已加仓次数动态调整加仓规模
+    #         position_batch_decay = ParamAccessor.get_param(self, 'position_batch_decay')
+    #         batch_factor = max(0.5, 1.0 - (self.added_batches * position_batch_decay))
+    #         add_size = int(add_size * batch_factor)
+
+    #         if add_size >= min_meaningful_trade:
+    #             # 只在这里输出成功的加仓决策日志
+    #             self.strategy.log(f"加仓决策 - 规模: {add_size}股, 原因: {market_regime} dip buying",
+    #                             level="INFO")
+    #             return {
+    #                 'action': 'buy',
+    #                 'size': add_size,
+    #                 'reason': f'{market_regime} dip buying'
+    #             }
+
+    #     return None
 
     def _check_profit_taking(self, profit_pct, passive_mode, min_meaningful_trade,
                             current_position_size, current_day):
@@ -1967,32 +2049,34 @@ class PositionManager:
 
     def _check_stop_loss(self, holding_days, trend_strength, market_regime,
                         profit_pct, current_position_size, min_meaningful_trade, current_day):
-        """检查止损条件"""
-        # 使用参数而不是硬编码，并提前触发
-        trade_loss_pct = ParamAccessor.get_param(self, 'trade_loss_pct')  # 0.15
-        if (trend_strength < -2 and market_regime in ["downtrend"]) or profit_pct < -trade_loss_pct * 0.8:
-            # 根据持有天数调整止损阈值
-            if holding_days > 90:
-                loss_threshold = -0.20
-            elif holding_days > 60:
-                loss_threshold = -0.18
-            elif holding_days > 30:
-                loss_threshold = -0.15
+        """检查止损条件 - 高风险策略版本：大幅放宽止损"""
+        
+        # 高风险策略：只在极端情况止损
+        trade_loss_pct = ParamAccessor.get_param(self, 'trade_loss_pct')  # 0.08
+        
+        # 删除原有的过于敏感的逻辑
+        # 只保留真正的止损
+        if profit_pct < -trade_loss_pct:  # 只有亏损超过8%才止损
+            # 根据持有天数给予更多宽容
+            if holding_days > 30:
+                loss_threshold = -0.15  # 持有30天以上，15%止损
+            elif holding_days > 15:
+                loss_threshold = -0.12  # 持有15天以上，12%止损  
             else:
-                loss_threshold = -0.12
-
+                loss_threshold = -0.08  # 否则8%止损
+            
             if profit_pct < loss_threshold:
-                size_to_sell = max(int(current_position_size * 0.40), min_meaningful_trade)
-                size_to_sell = min(size_to_sell, current_position_size)
-
+                size_to_sell = current_position_size  # 全部卖出
+                
                 if size_to_sell >= min_meaningful_trade:
                     self._last_sell_day = current_day
                     return {
                         'action': 'sell',
                         'size': size_to_sell,
-                        'reason': f"{market_regime} intelligent stop loss"
+                        'reason': f"Stop loss at {profit_pct:.1%}"
                     }
-        return None
+        
+        return None  # 其他情况都不止损
 
     def _get_position_info(self):
         """获取当前仓位信息 - 统一计算，避免重复"""
@@ -2108,13 +2192,13 @@ class PositionManager:
                 return concentration_result
 
             # 5. 检查加仓条件
-            add_position_result = self._check_add_position(current_price, market_regime)
-            if add_position_result:
-                # 更新批次计数
-                self.added_batches += 1
-                self._last_add_bar = len(self.strategy)
-                self.strategy.log(f"有意义加仓 - 规模: {add_position_result['size']}股, 原因: {add_position_result['reason']}", level="INFO")
-                return add_position_result
+            if self.strategy.position and current_position_size > 0:  # 添加条件检查
+                add_position_result = self._check_add_position(current_price, market_regime)
+                if add_position_result:
+                    # 不要在这里增加批次计数，让notify_order处理
+                    self._last_add_bar = len(self.strategy)
+                    self.strategy.log(f"执行加仓 - {add_position_result['reason']}", level="CRITICAL")
+                    return add_position_result
 
             # 7. 新仓位保护期（改进版）
             new_position_protection_days = ParamAccessor.get_param(self, 'new_position_protection_days')
@@ -2165,44 +2249,51 @@ class PositionManager:
             raise
 
     def _check_enhanced_profit_levels(self, profit_pct):
-        """高风险高回报止盈 - 只在极端情况止盈"""
+        """高风险高回报止盈 - 修正版：降低门槛，增加交易频率"""
         
         self.strategy.log(f"检查止盈 - 当前盈利: {profit_pct:.1%}", level="INFO")
 
-        # 大幅提高门槛：低于50%不考虑止盈
-        if profit_pct < 0.50:
+        # 修正：大幅降低止盈门槛，从50%降到8%
+        if profit_pct < 0.08:  # 8%就可以考虑止盈
             return 0
         
         current_position_size = self.strategy.position.size
         
-        # 检查是否应该持有
+        # 检查技术指标是否支持继续持有
         should_hold = True
         
-        # 只有在以下情况才考虑止盈：
-        # 1. 趋势明显破坏
-        if self.strategy.ma_fast[0] < self.strategy.ma_slow[0] * 0.98:
-            should_hold = False
+        # 技术指标检查（保持原有逻辑但调整阈值）
+        if hasattr(self.strategy, 'ma_fast') and hasattr(self.strategy, 'ma_slow'):
+            try:
+                if len(self.strategy.ma_fast) > 0 and len(self.strategy.ma_slow) > 0:
+                    # 更敏感的均线死叉检测
+                    if self.strategy.ma_fast[0] < self.strategy.ma_slow[0] * 0.99:  # 从0.98改为0.99
+                        should_hold = False
+            except:
+                pass
         
-        # 2. MACD死叉
-        if (self.strategy.macd.macd[0] < self.strategy.macd.signal[0] and
-            self.strategy.macd.macd[-1] > self.strategy.macd.signal[-1]):
-            should_hold = False
+        # RSI超买检测（更敏感）
+        if hasattr(self.strategy, 'rsi'):
+            try:
+                if len(self.strategy.rsi) > 1:
+                    if self.strategy.rsi[0] > 75:  # 从70提高到75，但仍然合理
+                        should_hold = False
+            except:
+                pass
         
-        # 3. RSI超买后回落
-        if self.strategy.rsi[0] < 70 and self.strategy.rsi[-1] > 70:
-            should_hold = False
+        if should_hold and profit_pct < 0.20:  # 低于20%继续持有
+            return 0
         
-        if should_hold:
-            return 0  # 继续持有
-        
-        # 分级止盈（但门槛很高）
-        if profit_pct > 1.50:  # 150%以上
+        # 分级止盈（大幅降低门槛）
+        if profit_pct > 0.50:  # 50%以上
             return int(current_position_size * 0.50)
-        elif profit_pct > 1.00:  # 100%以上
+        elif profit_pct > 0.30:  # 30%以上
+            return int(current_position_size * 0.40)
+        elif profit_pct > 0.20:  # 20%以上
             return int(current_position_size * 0.33)
-        elif profit_pct > 0.70:  # 70%以上
+        elif profit_pct > 0.15:  # 15%以上
             return int(current_position_size * 0.25)
-        elif profit_pct > 0.50:  # 50%以上
+        elif profit_pct > 0.08:  # 8%以上
             return int(current_position_size * 0.20)
         
         return 0
@@ -3212,22 +3303,52 @@ class EnhancedStrategy(bt.Strategy):
                 self.log(f"数据积累中 - 当前: {len(self)}/{min_required_bars}", level="DEBUG")
             return
         
-        # ===== 关键修复：动态初始化指标 =====
-        # 删除原来的return检查，改为动态初始化
+        # ===== 关键修复：确保指标真正初始化 =====
         if not hasattr(self, '_indicators_initialized') or not self._indicators_initialized:
             # 尝试初始化指标
             if len(self.data) >= min_required_bars:
                 try:
                     self._initialize_indicators()
-                    if self._indicators_initialized:
+                    # 验证指标是否真的初始化成功
+                    if hasattr(self, 'ma_fast') and hasattr(self, 'ma_slow'):
+                        self._indicators_initialized = True
                         self.log("指标动态初始化成功", level="CRITICAL")
                     else:
-                        # 如果还是失败，使用备用方案
-                        self._indicators_initialized = True  # 强制标记为已初始化
-                        self.log("强制启用指标，继续执行策略", level="CRITICAL")
+                        # 创建简化版指标作为备用
+                        self.log("创建备用指标", level="CRITICAL")
+                        self.ma_fast = bt.indicators.SMA(self.data.close, period=12)
+                        self.ma_slow = bt.indicators.SMA(self.data.close, period=24)
+                        self.ma_mid = bt.indicators.SMA(self.data.close, period=48)
+                        self.ma_long = bt.indicators.SMA(self.data.close, period=96)
+                        self.macd = bt.indicators.MACD(self.data.close)
+                        self.atr = bt.indicators.ATR(self.data)
+                        self.rsi = bt.indicators.RSI(self.data.close)
+                        self.volume_ma = bt.indicators.SMA(self.data.volume, period=20)
+                        self.volatility = bt.indicators.StdDev(self.data.close, period=20)
+                        self._indicators_initialized = True
                 except Exception as e:
-                    self.log(f"指标初始化异常: {str(e)}，强制继续", level="CRITICAL")
-                    self._indicators_initialized = True  # 强制继续
+                    self.log(f"指标初始化异常: {str(e)}，创建最小指标集", level="CRITICAL")
+                    # 创建最小必需指标集
+                    try:
+                        self.ma_fast = bt.indicators.SMA(self.data.close, period=5)
+                        self.ma_slow = bt.indicators.SMA(self.data.close, period=10)
+                        self.ma_mid = bt.indicators.SMA(self.data.close, period=20)
+                        self.ma_long = bt.indicators.SMA(self.data.close, period=50)
+                        self.macd = bt.indicators.MACD(self.data.close, period_me1=8, period_me2=17, period_signal=6)
+                        self.atr = bt.indicators.ATR(self.data, period=14)
+                        self.rsi = bt.indicators.RSI(self.data.close, period=14)
+                        self.volume_ma = bt.indicators.SMA(self.data.volume, period=10)
+                        self.volatility = bt.indicators.StdDev(self.data.close, period=10)
+                        self._indicators_initialized = True
+                        self.log("最小指标集创建成功", level="CRITICAL")
+                    except:
+                        self.log("无法创建指标，跳过本轮", level="ERROR")
+                        return
+        
+        # 添加额外的安全检查
+        if not hasattr(self, 'ma_fast') or not hasattr(self, 'ma_slow'):
+            self.log("指标仍未就绪，跳过", level="WARNING")
+            return
         
         # 继续原有的调试日志
         self.log(f"next 执行 - 当前日期: {self.data.datetime.date(0)}", level="DEBUG")
@@ -3420,7 +3541,7 @@ class EnhancedStrategy(bt.Strategy):
                         'size': position_action['size'],
                         'bar': len(self)
                     })
-                    self.position_manager.added_batches += 1
+                    #self.position_manager.added_batches += 1
                     self.position_manager.last_add_bar = len(self)
                     return
 
@@ -4326,20 +4447,22 @@ class TradeAnalyzer:
         # 获取所有交易（包括未平仓）
         all_trades = trade_manager.executed_trades
         entry_trades = [t for t in all_trades if t.get('type') == 'entry']
+        exit_trades = [t for t in all_trades if t.get('type') == 'exit']  # 新增
         closed_trades = [t for t in all_trades if t.get('status') == 'closed']
 
         # 交易统计
-        if closed_trades:
-            winning_trades = sum(1 for t in closed_trades if t['pnl'] > 0)
-            total_pnl = sum(t['pnl'] for t in closed_trades)
+        if entry_trades:
+            winning_trades = sum(1 for t in closed_trades if t.get('pnl', 0) > 0) if closed_trades else 0
+            total_pnl = sum(t.get('pnl', 0) for t in closed_trades) if closed_trades else 0
+            
             stats['交易统计'] = {
-                '总交易次数': len(entry_trades),
+                '总交易次数': len(entry_trades),  # 使用entry_trades
                 '已平仓次数': len(closed_trades),
                 '未平仓次数': len(entry_trades) - len(closed_trades),
-                '胜率': (winning_trades / len(closed_trades) * 100),
-                '平均每笔收益': total_pnl / len(closed_trades),
-                '最大单笔收益': max((t['pnl'] for t in closed_trades), default=0),
-                '最大单笔亏损': min((t['pnl'] for t in closed_trades), default=0),
+                '胜率': (winning_trades / len(closed_trades) * 100) if closed_trades else 0,
+                '平均每笔收益': total_pnl / len(closed_trades) if closed_trades else 0,
+                '最大单笔收益': max((t.get('pnl', 0) for t in closed_trades), default=0),
+                '最大单笔亏损': min((t.get('pnl', 0) for t in closed_trades), default=0),
             }
         else:
             stats['交易统计'] = {
