@@ -74,7 +74,7 @@ class TradingParameters:
     min_position_size: int = 100      # 从10提到100
 
     # 获利了结参数
-    profit_trigger_1: float = 0.08    # 从0.20降到0.08（8%就开始止盈）
+    profit_trigger_1: float = 0.06  # 从0.08降到0.06，更容易触发盈利加仓
     profit_trigger_2: float = 0.15    # 从0.40降到0.15（15%第二次止盈）
 
     # 止损参数
@@ -116,14 +116,14 @@ class TradingParameters:
     new_position_protection_days: int = 3
 
     # 回调买入参数
-    dip_base_pct: float = 0.005
-    dip_per_batch: float = 0.005
+    dip_base_pct: float = 0.02  # 从0.005提高到0.02，更合理的回调要求
+    dip_per_batch: float = 0.01  # 从0.005提高到0.01，批次递增更明显
 
-    batches_allowed: int = 8
+    batches_allowed: int = 4
 
     lookback_days_for_dip: int = 20  # 回调检查的回望天数
     min_bars_after_add: int = 3  # 加仓后最小间隔天数
-    min_meaningful_shares: int = 50  # 最小有意义的股数，避免过小交易
+    min_meaningful_shares: int = 30
 
     # 趋势得分参数
     etf_trend_bias: float = 5.0
@@ -176,8 +176,8 @@ class TradingParameters:
     position_min_size_factor: float = 1.5
     position_cash_reserve: float = 0.05
 
-    position_batch_decay: float = 0.15
-    position_min_add_pct: float = 0.1
+    position_batch_decay: float = 0.10  # 从0.15降到0.10，减缓衰减
+    position_min_add_pct: float = 0.15  # 从0.1提高到0.15，增加每次加仓规模
 
     serverchan_sendkey: str = "SCT119824TW3DsGlBjkhAV9lJWIOLohv1P"  # Server酱的SendKey
     enable_trade_notification: bool = True  # 是否启用交易通知
@@ -1737,9 +1737,9 @@ class PositionManager:
         if not self.strategy.position:
             # 重置所有状态
             if self.added_batches > 0:
-                self.strategy.log(f"平仓后重置批次计数: {self.added_batches} → 0", level="INFO")
+                self.strategy.log(f"平仓后重置批次计数: {self.added_batches} → 0", level="CRITICAL")  # 改为CRITICAL级别
             self.did_time_exit = False
-            self.added_batches = 0
+            self.added_batches = 0  # 这行是正确的，空仓时应该重置
             self._last_sell_day = 0
             self._last_add_bar = None
             self._max_batches_logged = False
@@ -1833,7 +1833,7 @@ class PositionManager:
         return None
 
     def _check_add_position(self, current_price, market_regime):
-        """检查是否应该加仓 - 修复版"""
+        """检查是否应该加仓 - 优化版"""
         
         # 先检查是否有持仓
         if not self.strategy.position or self.strategy.position.size <= 0:
@@ -1842,7 +1842,7 @@ class PositionManager:
         # 获取趋势强度
         trend_strength = self.market_state.get_trend_strength()
         
-        # 检查批次限制（但要正确处理）
+        # 检查批次限制
         batches_allowed = ParamAccessor.get_param(self, 'batches_allowed')
         if self.added_batches >= batches_allowed:
             if not self._max_batches_logged:
@@ -1850,180 +1850,78 @@ class PositionManager:
                 self._max_batches_logged = True
             return None
         
-        # 高风险策略：更激进的加仓条件
-        # 条件1：盈利5%以上就可以加仓
+        # 计算当前盈亏
         profit_pct = (current_price / self.strategy.entry_price - 1) if self.strategy.entry_price > 0 else 0
-        if profit_pct > 0.05:
-            self.strategy.log(f"盈利加仓机会 - 当前盈利{profit_pct:.1%}", level="CRITICAL")
-            
-            # 计算加仓规模
-            portfolio_value = self.strategy.broker.getvalue()
-            cash_available = self.strategy.broker.get_cash()
-            
-            # 使用可用现金的30%加仓
-            add_ratio = 0.3
-            target_value = cash_available * add_ratio
-            add_size = int(target_value / current_price)
-            
-            # 确保有意义的规模
-            if add_size >= 50:
-                return {
-                    'action': 'buy',
-                    'size': add_size,
-                    'reason': f'Profit add position at {profit_pct:.1%}'
-                }
         
-        # 条件2：回调3%就加仓（原来要求太高）
-        if len(self.strategy.data.high) >= 10:
+        # 获取参数（不使用硬编码）
+        min_position_add_pct = ParamAccessor.get_param(self, 'position_min_add_pct')  # 0.15
+        min_meaningful_shares = ParamAccessor.get_param(self, 'min_meaningful_shares')  # 50
+        
+        # 检查资金
+        portfolio_value = self.strategy.broker.getvalue()
+        cash_available = self.strategy.broker.get_cash()
+        
+        # 需要至少15%的现金储备才加仓
+        min_cash_required = portfolio_value * min_position_add_pct
+        if cash_available < min_cash_required:
+            return None
+        
+        # 加仓条件判断（使用参数而非硬编码）
+        should_add = False
+        reason = ""
+        
+        # 条件1：盈利加仓（使用profit_trigger_1参数）
+        profit_trigger = ParamAccessor.get_param(self, 'profit_trigger_1')  # 0.08
+        if profit_pct > profit_trigger:
+            should_add = True
+            reason = f'Profit add at {profit_pct:.1%}'
+            self.strategy.log(f"盈利加仓条件满足: {profit_pct:.1%} > {profit_trigger:.1%}", level="DEBUG")
+        
+        # 条件2：回调加仓（使用dip_base_pct参数）
+        elif len(self.strategy.data.high) >= 10:
             recent_high = max(self.strategy.data.high.get(size=10))
             dip_pct = (recent_high - current_price) / recent_high
+            dip_threshold = ParamAccessor.get_param(self, 'dip_base_pct')  # 0.005
             
-            if dip_pct > 0.03:  # 3%回调就加仓
-                self.strategy.log(f"回调加仓机会 - 回调{dip_pct:.1%}", level="CRITICAL")
-                
-                cash_available = self.strategy.broker.get_cash()
-                add_ratio = 0.25
-                target_value = cash_available * add_ratio
-                add_size = int(target_value / current_price)
-                
-                if add_size >= 50:
-                    return {
-                        'action': 'buy', 
-                        'size': add_size,
-                        'reason': f'Dip add position at {dip_pct:.1%}'
-                    }
+            # 根据批次动态调整回调要求
+            dip_per_batch = ParamAccessor.get_param(self, 'dip_per_batch')  # 0.005
+            required_dip = dip_threshold + (self.added_batches * dip_per_batch)
+            
+            if dip_pct > required_dip:
+                should_add = True
+                reason = f'Dip add at {dip_pct:.1%}'
+                self.strategy.log(f"回调加仓条件满足: {dip_pct:.1%} > {required_dip:.1%}", level="DEBUG")
         
-        return None
-
-    # def _check_add_position(self, current_price, market_regime):
-    #     """检查是否应该加仓 - 优化版，保留所有原有逻辑"""
-    #     # 获取趋势强度
-    #     trend_strength = self.market_state.get_trend_strength()
-
-    #     # 先检查批次限制
-    #     batches_allowed = ParamAccessor.get_param(self, 'batches_allowed')
-    #     if self.added_batches >= batches_allowed:
-    #         # 不要静默返回，至少输出一次日志
-    #         if not hasattr(self, '_batch_limit_logged') or not self._batch_limit_logged:
-    #             self.strategy.log(f"达到最大加仓批次{batches_allowed}，停止加仓", level="CRITICAL")
-    #             self._batch_limit_logged = True
-    #         return None
-
-    #     # 强趋势直接加仓
-    #     if trend_strength > 15 and market_regime in ["strong_uptrend", "uptrend"]:
-    #         portfolio_value = self.strategy.broker.getvalue()
-    #         cash_available = self.strategy.broker.get_cash()
-
-    #         # 修改：降低现金要求，从5%降到1%
-    #         min_cash_required = portfolio_value * 0.01
-
-    #         if cash_available < min_cash_required:
-    #             self.strategy.log(f"现金不足：${cash_available:.2f} < ${min_cash_required:.2f}", level="INFO")
-    #             return None
-
-    #         self.strategy.log(f"强趋势加仓执行检查 - 趋势{trend_strength:.1f}，现金${cash_available:.2f}", level="DEBUG")
-
-    #         # 修改：使用更激进的加仓比例
-    #         batch_decay = ParamAccessor.get_param(self, 'position_batch_decay')
-    #         # 提高基础加仓比例，从0.35提高到0.5
-    #         add_ratio = 0.5 * (1.0 - batch_decay * self.added_batches)
-    #         add_ratio = max(add_ratio, 0.2)  # 从0.15提高到0.2
-
-    #         target_value = cash_available * add_ratio
-    #         add_size = int(target_value / current_price)
-
-    #         # 降低最小加仓规模要求
-    #         min_add_size = max(20, int(portfolio_value * 0.02 / current_price))  # 从0.05降到0.02
-
-    #         if add_size < min_add_size:
-    #             self.strategy.log(f"加仓规模过小：{add_size} < {min_add_size}，跳过", level="INFO")
-    #             return None
-
-    #         self.strategy.log(f"强趋势加仓通过所有检查，准备执行{add_size}股", level="CRITICAL")
-
-    #         return {
-    #             'action': 'buy',
-    #             'size': add_size,
-    #             'reason': 'Strong trend following'
-    #         }
-
-    #     # 回调买入检查
-    #     dip_signal = self._should_buy_the_dip(current_price)
-
-    #     if dip_signal:
-    #         # 批次限制检查
-    #         batches_allowed = ParamAccessor.get_param(self, 'batches_allowed')
-
-    #         # 结合当前仓位比例进一步限制批次
-    #         position_ratio = self._position_cache.get('position_pct', 0)
-    #         if position_ratio > 0.7:
-    #             batches_max = batches_allowed - 2
-    #         elif position_ratio > 0.5:
-    #             batches_max = batches_allowed - 1
-    #         else:
-    #             batches_max = batches_allowed
-
-    #         # 如果持仓时间很长且有较大回调，允许额外加仓
-    #         if self.strategy.position and self.strategy.get_holding_days() > 60:
-    #             recent_high = max(self.strategy.data.high.get(size=20))
-    #             current_dip = (recent_high - current_price) / recent_high
-    #             if current_dip > 0.10:  # 从高点回调超过10%
-    #                 batches_max += 2  # 允许额外2次加仓
-    #                 self.strategy.log(f"大幅回调，临时增加批次限制至{batches_max}", level="INFO")
-
-    #         if self.added_batches >= batches_max:
-    #             if not hasattr(self, '_max_batches_logged') or not self._max_batches_logged:
-    #                 self.strategy.log(f"达到最大加仓次数: {self.added_batches}/{batches_max}", level="INFO")
-    #                 self._max_batches_logged = True
-    #             return None
-
-    #         # 特殊情况：长期持仓的趋势加仓
-    #         if self.strategy.position and self.strategy.get_holding_days() > 90:
-    #             current_pnl = (current_price / self.strategy.entry_price - 1)
-    #             if current_pnl > 0.15 and market_regime in ["uptrend", "strong_uptrend"]:
-    #                 # 检查是否有短期回调（不要求低于买入价）
-    #                 short_term_high = max(self.strategy.data.high.get(size=10))
-    #                 short_dip = (short_term_high - current_price) / short_term_high
-
-    #                 if short_dip >= 0.02:  # 从10天高点回调2%即可
-    #                     self.strategy.log(
-    #                         f"ETF趋势加仓机会 - 持仓{self.strategy.get_holding_days()}天，"
-    #                         f"盈利{current_pnl*100:.1f}%，短期回调{short_dip*100:.1f}%",
-    #                         level="INFO"
-    #                     )
-    #                     # 允许加仓，绕过严格的价格检查
-    #                     dip_signal = True
-
-    #         # 计算加仓规模
-    #         add_size = self._calculate_position_size()
-
-    #         if add_size == 0:
-    #             self.strategy.log("跳过加仓 - 计算的加仓规模无效", level="INFO")
-    #             return None
-
-    #         # 确保加仓规模有意义
-    #         portfolio_value = self.strategy.broker.getvalue()
-    #         portfolio_factor = max(1.0, portfolio_value / 100000)
-
-    #         min_meaningful_trade = max(15, int(15 * portfolio_factor))
-    #         add_size = max(add_size, min_meaningful_trade)
-
-    #         # 根据已加仓次数动态调整加仓规模
-    #         position_batch_decay = ParamAccessor.get_param(self, 'position_batch_decay')
-    #         batch_factor = max(0.5, 1.0 - (self.added_batches * position_batch_decay))
-    #         add_size = int(add_size * batch_factor)
-
-    #         if add_size >= min_meaningful_trade:
-    #             # 只在这里输出成功的加仓决策日志
-    #             self.strategy.log(f"加仓决策 - 规模: {add_size}股, 原因: {market_regime} dip buying",
-    #                             level="INFO")
-    #             return {
-    #                 'action': 'buy',
-    #                 'size': add_size,
-    #                 'reason': f'{market_regime} dip buying'
-    #             }
-
-    #     return None
+        # 条件3：强势趋势加仓
+        elif trend_strength > 15 and market_regime in ["strong_uptrend", "uptrend"]:
+            should_add = True
+            reason = f'Trend add at strength {trend_strength:.1f}'
+            self.strategy.log(f"趋势加仓条件满足: 趋势{trend_strength:.1f}", level="DEBUG")
+        
+        if not should_add:
+            return None
+        
+        # 计算加仓规模
+        batch_decay = ParamAccessor.get_param(self, 'position_batch_decay')  # 0.10
+        base_ratio = 0.3  # 基础加仓30%可用现金
+        add_ratio = base_ratio * (1.0 - batch_decay * self.added_batches)
+        add_ratio = max(add_ratio, 0.15)  # 最少15%
+        
+        target_value = cash_available * add_ratio
+        add_size = int(target_value / current_price)
+        
+        # 确保有意义的规模
+        if add_size < min_meaningful_shares:
+            self.strategy.log(f"加仓规模过小: {add_size} < {min_meaningful_shares}", level="DEBUG")
+            return None
+        
+        self.strategy.log(f"加仓决策通过 - 规模: {add_size}股, 原因: {reason}", level="CRITICAL")
+        
+        return {
+            'action': 'buy',
+            'size': add_size,
+            'reason': reason
+        }
 
     def _check_profit_taking(self, profit_pct, passive_mode, min_meaningful_trade,
                             current_position_size, current_day):
@@ -3529,10 +3427,11 @@ class EnhancedStrategy(bt.Strategy):
                 )
 
                 # 16.3 执行建议的操作
+                # 修复后的代码
                 if position_action['action'] == 'buy':
                     # 加仓
                     self.log(f"加仓决策 - 规模: {position_action['size']}股, 原因: {position_action['reason']}",
-                             level="INFO")
+                            level="INFO")
                     self.order = self.buy(size=position_action['size'])
                     # 记录买入价格
                     self.position_manager._last_buy_price = current_price
@@ -3541,8 +3440,10 @@ class EnhancedStrategy(bt.Strategy):
                         'size': position_action['size'],
                         'bar': len(self)
                     })
-                    #self.position_manager.added_batches += 1
+                    self.position_manager.added_batches += 1  # ← 取消注释，恢复批次计数！
                     self.position_manager.last_add_bar = len(self)
+                    self.log(f"加仓批次更新: {self.position_manager.added_batches}/{ParamAccessor.get_param(self.position_manager, 'batches_allowed')}", 
+                            level="CRITICAL")  # 添加调试日志
                     return
 
                 elif position_action['action'] == 'sell':
