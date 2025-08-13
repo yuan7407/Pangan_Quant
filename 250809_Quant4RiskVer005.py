@@ -38,7 +38,7 @@ def get_market_session(dt_local: datetime.datetime, include_prepost: bool = True
     - prepost=True 时，'pre' 与 'after' 也视为可交易。
     """
     try:
-        # 统一到美东时间（若无时区，默认按美东处理，避免历史数据被误判）
+        # 统一到美东时间（若无时区，默认按美东处理；回测数据已按美东会话筛选）
         if dt_local.tzinfo is None:
             dt_local = dt_local.replace(tzinfo=ZoneInfo("America/New_York"))
         dt_et = dt_local.astimezone(ZoneInfo("America/New_York"))
@@ -185,9 +185,9 @@ class TradingParameters:
 
     new_position_protection_days: int = 3
 
-    # 回调买入参数
-    dip_base_pct: float = 0.08  # 从0.02改为0.05（5%回调才首次加仓）
-    dip_per_batch: float = 0.03  # 从0.01改为0.02（批次间隔拉大）
+    # 回调买入参数（更保守，降低下行环境中不断摊薄的风险）
+    dip_base_pct: float = 0.10  # 默认10%
+    dip_per_batch: float = 0.04  # 批次间隔4%
 
     batches_allowed: int = 8
 
@@ -228,12 +228,15 @@ class TradingParameters:
     position_add_base_pct: float = 0.30  # 基础加仓占用可用现金比例（原硬编码0.30）
 
     serverchan_sendkey: str = "SCT119824TW3DsGlBjkhAV9lJWIOLohv1P"  # Server酱的SendKey
+    # 新增：企业微信群机器人 & Server酱渠道
+    wecom_webhook_url: str = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=dd52bd7c-a8a2-4406-8332-714faaa3185e"
+    serverchan_channel: str = "9|1"  # 例如 "9|1" 同时服务号与企业微信群机器人
     enable_trade_notification: bool = True  # 是否启用交易通知
     enable_risk_notification: bool = True   # 是否启用风险提醒
     notification_min_pnl: float = 100.0     # 最小通知盈亏金额
     live_mode: bool = False  # 是否为实时交易模式
     data_check_interval: int = 60  # 数据检查间隔（秒）
-    max_data_delay: int = 300  # 最大数据延迟（秒）
+    max_data_delay: int = 3600  # 最大数据延迟（秒）
     generate_live_report: bool = True  # 实时运行结束后是否生成历史回测报告
     history_days: int = 3650
 
@@ -244,8 +247,10 @@ class TradingParameters:
     # 新增：核心仓位与当日止盈限制
     core_position_min_ratio: float = 0.30  # 至少保留30%核心仓位
     max_take_profit_actions_per_day: int = 2  # 单日最多止盈次数
-    take_profit_cooldown_bars: int = 6       # 止盈后冷却最少bar数（1h→约1日）
+    take_profit_cooldown_bars: int = 4
     allow_profit_add: bool = True           # 默认禁止"盈利加仓"
+    # 强势市场的动态限制
+    tp_strong_up_max_actions_per_day: int = 1  # 强势上行时，每日最多止盈次数
 
     # 盈利加仓限制
     profit_add_rsi_cap: float = 70.0        # RSI高于此值不做盈利加仓，避免高位追涨
@@ -274,6 +279,48 @@ class TradingParameters:
     intraday_multiplier: int = 26  # 15分钟K线：每天6.5小时 * 4 = 26根
     min_data_points: int = 200
     intraday_min_bars_between_trades: int = 3  # 日内模式最小交易间隔bar数
+
+    # 盈利加仓的额外过滤与冷却
+    profit_add_cooldown_bars: int = 6
+    max_profit_adds_per_day: int = 1
+    profit_add_long_ma_premium_cap: float = 0.25  # 相对长均线溢价上限（25%）
+
+    # 强势/上行市场的动态参数
+    dynamic_core_min_ratio_strong: float = 0.50
+    dynamic_core_min_ratio_uptrend: float = 0.40
+    dynamic_concentration_threshold_strong: float = 0.95
+    dynamic_concentration_profit_threshold_strong: float = 0.25
+
+    # 批次衰减（解决“前期一次性用完批次，后期无法加仓”）
+    enable_add_batches_decay: bool = True
+    add_batches_decay_days: int = 8
+
+    # 分笔止损与时限退出（避免长期浮亏占用仓位导致胜率虚高/后段无交易）
+    per_lot_stop_loss_pct: float = 0.18
+    max_holding_bars_loss_exit: int = 200
+    stagnation_relax_bars: int = 80
+    # 单笔卖出规模上限（降低最大单笔亏损、平滑回撤），按当前持仓比例
+    max_single_exit_ratio: float = 0.15
+    # 当日亏损保护（仅日内模式生效）：当日回撤超过阈值时，触发小比例去风险
+    daily_loss_guard_pct: float = 0.08
+    daily_loss_guard_sell_ratio: float = 0.20
+    # 回调加仓的额外门槛：跌破中/慢均线时需要RSI反弹（<30→>35）才允许加仓
+    dip_add_require_above_ma: bool = True
+    dip_add_require_rsi_bounce: bool = True
+    # 日内节流：卖出后N个bar内禁止加仓；每日最大加仓次数与每日最大老化亏损退出次数
+    post_sell_cooldown_bars: int = 5
+    max_adds_per_day: int = 2
+    max_aging_exits_per_day: int = 1
+    aging_exit_min_spacing_bars: int = 6
+
+    # 心跳/推送配置
+    heartbeat_interval_seconds: int = 1800  # 系统心跳推送间隔（默认30分钟）
+    heartbeat_include_returns: bool = True  # 心跳是否包含价格/当日/总收益率
+
+    # 实时运行日志节流
+    enable_periodic_signal_log: bool = False   # 是否定期打印信号检查（默认关闭）
+    enable_periodic_account_log: bool = False  # 是否定期打印账户状态（默认关闭）
+    periodic_log_interval_bars: int = 100      # 定期打印的bar间隔
 
     hot_stocks_2025: List[str] = None  # 将在__post_init__中初始化
 
@@ -308,6 +355,26 @@ class TradingParameters:
         # 日内模式下，提高最小交易间隔，减少过度交易
         if self.intraday_mode:
             self.min_bars_between_trades = max(self.min_bars_between_trades, self.intraday_min_bars_between_trades)
+
+        # 准确设置每个交易日的bars数，用于年化和波动率聚合
+        try:
+            di = (self.data_interval or "1d").lower()
+            if di in ("1d", "1day"):
+                self.intraday_multiplier = 1
+            elif di in ("1h", "60m", "1hour"):
+                # 美股单日约6.5小时，向上取整
+                self.intraday_multiplier = 7
+            elif di in ("30m", "30min"):
+                self.intraday_multiplier = 13
+            elif di in ("15m", "15min"):
+                self.intraday_multiplier = 26
+            elif di in ("5m", "5min"):
+                self.intraday_multiplier = 78
+            else:
+                # 其他周期：按1天估算
+                self.intraday_multiplier = max(1, self.intraday_multiplier)
+        except Exception:
+            pass
 
         # 添加极端值警告
         if self.trailing_activation_base <= 0 or self.trailing_activation_base >= 1:
@@ -1003,6 +1070,28 @@ class MarketState:
                 if vol_ratio > 1.5 and current_price > self.strategy.data.close[-1]:
                     self.strategy.log(f"放量上涨信号 - 成交量{vol_ratio:.1f}倍", level="CRITICAL")
                     return True
+
+            # 条件9：微调触发器（提升中后期触发概率）
+            try:
+                # 当未交易天数较多时，适度放宽触发（避免“前密后疏”）
+                bars_since_last = (len(self.strategy) - getattr(self.strategy, 'last_trade_bar', 0)) if hasattr(self.strategy, 'last_trade_bar') else 9999
+                if bars_since_last >= 60:  # 两到三个月未交易
+                    # 放宽动量与突破阈值
+                    if len(self.strategy.data.close) >= momentum_window:
+                        mom_ret = (current_price / self.strategy.data.close[-momentum_window] - 1)
+                        if mom_ret > 0.02:
+                            self.strategy.log("久未交易放宽：动量信号触发", level="INFO")
+                            return True
+                    if len(self.strategy.data.high) >= 2:
+                        vals = list(self.strategy.data.high.get(size=min(breakout_window, len(self.strategy.data.high))))[:-1]
+                        vals = [v for v in vals if pd.notna(v)]
+                        if vals:
+                            recent_high = max(vals)
+                            if recent_high > 0 and current_price > recent_high * 1.005:
+                                self.strategy.log("久未交易放宽：微突破触发", level="INFO")
+                                return True
+            except Exception:
+                pass
     
         
         except (IndexError, AttributeError) as e:
@@ -1633,6 +1722,13 @@ class RiskManager:
                         sell_ratio = 0.25
                     size_to_sell = max(ParamAccessor.get_param(self, 'min_meaningful_shares'), int(position_size * sell_ratio))
                     size_to_sell = min(size_to_sell, position_size)
+                    # 进一步限制单笔卖出规模，降低最大单笔亏损/回撤突刺
+                    try:
+                        max_single_exit_ratio = ParamAccessor.get_param(self, 'max_single_exit_ratio')
+                    except Exception:
+                        max_single_exit_ratio = 0.15
+                    size_cap = max(ParamAccessor.get_param(self, 'min_meaningful_shares'), int(position_size * max_single_exit_ratio))
+                    size_to_sell = min(size_to_sell, size_cap)
                     if size_to_sell > 0:
                         self.strategy.log(
                             f"保护性止盈触发 - 保护价{protect_stop_price:.2f}，当前{current_price:.2f}，卖出{size_to_sell}",
@@ -1876,14 +1972,26 @@ class PositionManager:
                                      current_position_size, current_price,
                                      min_meaningful_trade, profit_pct, current_day):
         """检查仓位集中度风险"""
-        # 修改：从0.7提高到0.85，让策略能持有更多仓位
-        # 修改：盈利门槛从0.05提高到0.15，避免小幅盈利就减仓
+        # 动态阈值：强势上涨期放宽集中度阈值，避免过早减仓
         concentration_threshold = ParamAccessor.get_param(self, 'max_position_ratio_uptrend')
         profit_threshold = ParamAccessor.get_param(self, 'concentration_profit_threshold')
+        try:
+            market_regime = self.market_state.get_market_regime()
+            if market_regime == 'strong_uptrend':
+                concentration_threshold = max(
+                    concentration_threshold,
+                    ParamAccessor.get_param(self, 'dynamic_concentration_threshold_strong')
+                )
+                profit_threshold = max(
+                    profit_threshold,
+                    ParamAccessor.get_param(self, 'dynamic_concentration_profit_threshold_strong')
+                )
+        except Exception:
+            pass
         if position_ratio > concentration_threshold and profit_pct > profit_threshold:
             self.strategy.log(f"风险控制 - 仓位过度集中({position_ratio:.1%})，执行减仓", level="INFO")
 
-            # 修改：目标仓位从0.6提高到0.75
+            # 强势上行保留更大核心仓位
             target_ratio = 0.75
             target_value = portfolio_value * target_ratio
             target_size = int(target_value / current_price)
@@ -1891,7 +1999,13 @@ class PositionManager:
 
             # 确保减仓量有意义
             reduce_size = max(reduce_size, min_meaningful_trade)
-            reduce_size = min(reduce_size, current_position_size)
+            # 单笔卖出规模上限，平滑回撤/避免最大单笔亏损过大
+            try:
+                max_single_exit_ratio = ParamAccessor.get_param(self, 'max_single_exit_ratio')
+            except Exception:
+                max_single_exit_ratio = 0.15
+            reduce_size_cap = max(min_meaningful_trade, int(current_position_size * max_single_exit_ratio))
+            reduce_size = min(reduce_size, reduce_size_cap, current_position_size)
 
             if reduce_size >= min_meaningful_trade:
                 self._last_sell_day = current_day
@@ -1920,19 +2034,26 @@ class PositionManager:
                 self._max_batches_logged = True
             return None
         
-        # 计算当前盈亏
-        profit_pct = (current_price / self.strategy.entry_price - 1) if self.strategy.entry_price > 0 else 0
+        # 计算当前盈亏（使用平均成本）
+        try:
+            avg_entry = self.strategy.get_average_entry_price()
+        except Exception:
+            avg_entry = getattr(self.strategy, 'entry_price', 0)
+        profit_pct = (current_price / avg_entry - 1) if avg_entry and avg_entry > 0 else 0
         
         # 获取参数（不使用硬编码）
         min_position_add_pct = ParamAccessor.get_param(self, 'position_min_add_pct')  # 0.15
         min_meaningful_shares = ParamAccessor.get_param(self, 'min_meaningful_shares')  # 50
         
-        # 检查资金
+        # 检查资金（修复：后半段因现金门槛过高导致长期不交易）
         portfolio_value = self.strategy.broker.getvalue()
         cash_available = self.strategy.broker.get_cash()
-        
-        # 需要至少15%的现金储备才加仓
-        min_cash_required = portfolio_value * min_position_add_pct
+        # 使用“有意义交易规模”作为最低门槛的主约束；
+        # 若仍希望保留部分现金比例要求，则打7折（显著降低阻断概率）
+        min_cash_required = max(
+            current_price * min_meaningful_shares,
+            portfolio_value * min_position_add_pct * 0.3
+        )
         if cash_available < min_cash_required:
             return None
         
@@ -1940,9 +2061,18 @@ class PositionManager:
         should_add = False
         reason = ""
         
-        # 条件1：盈利加仓（受 allow_profit_add 开关控制 + 止盈后冷却/当日互斥）
+        # 条件1：盈利加仓（受 allow_profit_add 开关控制 + 止盈/盈利加仓冷却/当日互斥）
         profit_trigger = ParamAccessor.get_param(self, 'profit_trigger_1')  # 0.25（已提高门槛）
         if ParamAccessor.get_param(self, 'allow_profit_add') and profit_pct > profit_trigger:
+            # 盈利加仓冷却：防止一天内连环追高
+            try:
+                if getattr(self, '_profit_add_day', None) == len(self.strategy):
+                    return None
+                profit_add_cooldown = ParamAccessor.get_param(self, 'profit_add_cooldown_bars')
+                if hasattr(self, '_last_profit_add_bar') and (len(self.strategy) - getattr(self, '_last_profit_add_bar', 0) < profit_add_cooldown):
+                    return None
+            except Exception:
+                pass
             # 额外过滤：避免在过热/过高溢价时盈利加仓
             try:
                 rsi_ok = True
@@ -1991,11 +2121,36 @@ class PositionManager:
             else:
                 recent_high = 0.0
             dip_pct = (recent_high - current_price) / recent_high if recent_high > 0 else 0.0
-            dip_threshold = ParamAccessor.get_param(self, 'dip_base_pct')  # 0.02
+            dip_threshold = ParamAccessor.get_param(self, 'dip_base_pct')
 
             # 根据批次动态调整回调要求（百分比增量）
-            dip_per_batch = ParamAccessor.get_param(self, 'dip_per_batch')  # 0.01
+            dip_per_batch = ParamAccessor.get_param(self, 'dip_per_batch')
             required_dip = dip_threshold + (self.added_batches * dip_per_batch)
+
+            # 长时间未加仓时允许小幅降低回调要求，提升中后期触发概率
+            try:
+                bars_since_last_add = len(self.strategy) - (self._last_add_bar or 0)
+                if bars_since_last_add >= 80:
+                    required_dip = max(0.06, required_dip - 0.02)
+            except Exception:
+                pass
+
+            # 额外过滤（修复逻辑）：当价格同时低于中/慢均线时，必须出现RSI反弹信号才允许回调加仓
+            try:
+                need_ma_filter = ParamAccessor.get_param(self, 'dip_add_require_above_ma')
+                need_rsi_bounce = ParamAccessor.get_param(self, 'dip_add_require_rsi_bounce')
+                if need_ma_filter and hasattr(self.strategy, 'ma_mid') and hasattr(self.strategy, 'ma_slow'):
+                    ma_mid_v = float(self.strategy.ma_mid[0]) if len(self.strategy.ma_mid) > 0 else 0.0
+                    ma_slow_v = float(self.strategy.ma_slow[0]) if len(self.strategy.ma_slow) > 0 else 0.0
+                    if ma_mid_v > 0 and ma_slow_v > 0 and current_price < ma_mid_v and current_price < ma_slow_v:
+                        if need_rsi_bounce and hasattr(self.strategy, 'rsi') and len(self.strategy.rsi) > 1:
+                            # 需要明确的反弹：上一bar<30 且 当前>35
+                            if not (self.strategy.rsi[-1] < 30 and self.strategy.rsi[0] > 35):
+                                return None
+                        elif need_rsi_bounce:
+                            return None
+            except Exception:
+                pass
 
             if dip_pct >= required_dip:
                 should_add = True
@@ -2015,6 +2170,26 @@ class PositionManager:
                 should_add = True
                 reason = f'Trend add at strength {trend_strength:.1f}'
                 self.strategy.log(f"趋势加仓条件满足: 趋势{trend_strength:.1f}", level="DEBUG")
+
+        # 下跌市场禁止“回调加仓”与“趋势加仓”
+        if market_regime == 'downtrend':
+            # 允许在下跌市的极端超跌反弹中触发一次少量加仓（RSI<30回到>35且放量）
+            try:
+                if hasattr(self.strategy, 'rsi') and len(self.strategy.rsi) > 1 and self.strategy.rsi[-1] < 30 and self.strategy.rsi[0] > 35:
+                    if hasattr(self.strategy, 'volume_ma') and self.strategy.data.volume[0] > self.strategy.volume_ma[0] * 1.5:
+                        add_ratio = 0.12
+                        target_value = cash_available * add_ratio
+                        add_size = int(target_value / current_price)
+                        if add_size >= ParamAccessor.get_param(self, 'min_meaningful_shares'):
+                            self.strategy.log("下跌市反弹小幅加仓（一次性）", level="INFO")
+                            return {
+                                'action': 'buy',
+                                'size': add_size,
+                                'reason': 'Oversold rebound add'
+                            }
+            except Exception:
+                pass
+            return None
         
         if not should_add:
             return None
@@ -2035,6 +2210,13 @@ class PositionManager:
             self.strategy.log(f"加仓规模过小: {add_size} < {min_meaningful_shares}", level="DEBUG")
             return None
         
+        # 盈利加仓计数与冷却标记
+        try:
+            if 'Profit add' in reason:
+                self._last_profit_add_bar = len(self.strategy)
+                self._profit_add_day = len(self.strategy)
+        except Exception:
+            pass
         self.strategy.log(f"加仓决策通过 - 规模: {add_size}股, 原因: {reason}", level="CRITICAL")
         
         return {
@@ -2059,8 +2241,21 @@ class PositionManager:
             take_profit_size = self._check_enhanced_profit_levels(profit_pct)
 
             if take_profit_size > 0:
-                # 保留核心仓位
-                min_core = int(current_position_size * ParamAccessor.get_param(self, 'core_position_min_ratio'))
+                # 获取当前市场状态
+                try:
+                    market_regime = self.market_state.get_market_regime()
+                except Exception:
+                    market_regime = 'sideways'
+                # 保留核心仓位（强势/上行市场提高核心比例）
+                min_core_ratio = ParamAccessor.get_param(self, 'core_position_min_ratio')
+                try:
+                    if market_regime == 'strong_uptrend':
+                        min_core_ratio = max(min_core_ratio, ParamAccessor.get_param(self, 'dynamic_core_min_ratio_strong'))
+                    elif market_regime == 'uptrend':
+                        min_core_ratio = max(min_core_ratio, ParamAccessor.get_param(self, 'dynamic_core_min_ratio_uptrend'))
+                except Exception:
+                    pass
+                min_core = int(current_position_size * min_core_ratio)
                 max_sellable = max(0, current_position_size - min_core)
                 take_profit_size = min(take_profit_size, max_sellable)
 
@@ -2081,6 +2276,13 @@ class PositionManager:
 
                 if take_profit_size >= min_meaningful_trade:
                     self._last_sell_day = current_day
+                    # 强势期限制每日止盈次数
+                    try:
+                        if market_regime == 'strong_uptrend':
+                            if self._take_profit_actions_today >= ParamAccessor.get_param(self, 'tp_strong_up_max_actions_per_day'):
+                                return None
+                    except Exception:
+                        pass
                     self._take_profit_actions_today += 1
                     return {
                         'action': 'sell',
@@ -2169,6 +2371,19 @@ class PositionManager:
             if self._check_position_reset():
                 return result
 
+            # 1.1 批次计数“衰减复位”：过了N天自动释放一个批次，避免开局一次性用完导致中期无操作
+            try:
+                if ParamAccessor.get_param(self, 'enable_add_batches_decay') and self.added_batches > 0:
+                    last_add = getattr(self, '_last_add_bar', None)
+                    if last_add is not None:
+                        decay_days = ParamAccessor.get_param(self, 'add_batches_decay_days')
+                        if len(self.strategy) - last_add >= decay_days:
+                            self.added_batches = max(0, self.added_batches - 1)
+                            self._last_add_bar = len(self.strategy)
+                            self.strategy.log(f"加仓批次自然衰减释放：剩余批次 {self.added_batches}", level="INFO")
+            except Exception:
+                pass
+
             # 新增：针对极小仓位的特殊处理
             micro_shares = ParamAccessor.get_param(self, 'micro_position_shares')
             micro_ratio = ParamAccessor.get_param(self, 'micro_position_ratio')
@@ -2211,12 +2426,68 @@ class PositionManager:
 
             # 5. 检查加仓条件
             if self.strategy.position and current_position_size > 0:  # 添加条件检查
-                add_position_result = self._check_add_position(current_price, market_regime)
+                # 当天与卖出后冷却限制（避免在单日形成加仓/老化减仓风暴）
+                try:
+                    if getattr(self, '_last_sell_bar', None) is not None:
+                        if len(self.strategy) - self._last_sell_bar < ParamAccessor.get_param(self, 'post_sell_cooldown_bars'):
+                            add_position_result = None
+                        else:
+                            add_position_result = self._check_add_position(current_price, market_regime)
+                    else:
+                        add_position_result = self._check_add_position(current_price, market_regime)
+                except Exception:
+                    add_position_result = self._check_add_position(current_price, market_regime)
                 if add_position_result:
                     # 不要在这里增加批次计数，让notify_order处理
                     self._last_add_bar = len(self.strategy)
                     self.strategy.log(f"执行加仓 - {add_position_result['reason']}", level="CRITICAL")
                     return add_position_result
+
+            # 5.1 老化亏损/期限退出（产生真实的亏损exit，释放仓位/现金，恢复后半段交易活性）
+            try:
+                per_lot_stop = -abs(ParamAccessor.get_param(self, 'per_lot_stop_loss_pct'))  # e.g., -0.18
+                max_hold_bars = ParamAccessor.get_param(self, 'max_holding_bars_loss_exit')  # e.g., 200 bars
+                # 若整体持仓亏损超过阈值，或持有时间过长仍为亏损，则减仓一部分
+                if (profit_pct <= per_lot_stop) or (profit_pct < 0 and holding_days >= max_hold_bars):
+                    # 单日老化退出次数限制
+                    if getattr(self, '_aging_exit_day', None) != current_day:
+                        self._aging_exit_day = current_day
+                        self._aging_exit_count = 0
+                    if self._aging_exit_count >= ParamAccessor.get_param(self, 'max_aging_exits_per_day'):
+                        return None
+                    # 老化退出最小bar间隔，避免同日/相邻bar连发
+                    try:
+                        min_space = ParamAccessor.get_param(self, 'aging_exit_min_spacing_bars')
+                    except Exception:
+                        min_space = 6
+                    if getattr(self, '_last_aging_exit_bar', None) is not None:
+                        if len(self.strategy) - self._last_aging_exit_bar < min_space:
+                            return None
+                    loss_trim_ratio = 0.20 if profit_pct <= per_lot_stop else 0.15
+                    trim_size = max(min_meaningful_trade, int(current_position_size * loss_trim_ratio))
+                    # 单笔退出规模上限
+                    try:
+                        max_single_exit_ratio = ParamAccessor.get_param(self, 'max_single_exit_ratio')
+                    except Exception:
+                        max_single_exit_ratio = 0.15
+                    trim_cap = max(min_meaningful_trade, int(current_position_size * max_single_exit_ratio))
+                    trim_size = min(trim_size, trim_cap)
+                    if trim_size > 0:
+                        self.strategy.log(
+                            f"老化亏损退出 - 持有{holding_days}天, 盈亏{profit_pct:.1%}, 减仓{trim_size}",
+                            level="CRITICAL"
+                        )
+                        self._aging_exit_count += 1
+                        # 记录卖出bar，限制短期反向加仓
+                        self._last_sell_bar = len(self.strategy)
+                        self._last_aging_exit_bar = len(self.strategy)
+                        return {
+                            'action': 'sell',
+                            'size': trim_size,
+                            'reason': 'Aging loss exit'
+                        }
+            except Exception:
+                pass
 
             # 7. 新仓位保护期（改进版）
             new_position_protection_days = ParamAccessor.get_param(self, 'new_position_protection_days')
@@ -2248,9 +2519,15 @@ class PositionManager:
                     cooldown = ParamAccessor.get_param(self, 'take_profit_cooldown_bars')
                     if hasattr(self, '_last_take_profit_bar') and (current_day - self._last_take_profit_bar) < cooldown:
                         return None
-                    # 确保卖出规模有意义
+                    # 确保卖出规模有意义 + 单笔退出规模上限
                     take_profit_size = max(take_profit_size, min_meaningful_trade)
                     take_profit_size = min(take_profit_size, current_position_size)
+                    try:
+                        max_single_exit_ratio = ParamAccessor.get_param(self, 'max_single_exit_ratio')
+                    except Exception:
+                        max_single_exit_ratio = 0.15
+                    size_cap = max(min_meaningful_trade, int(current_position_size * max_single_exit_ratio))
+                    take_profit_size = min(take_profit_size, size_cap)
 
                     # 与上方一致的风险联动限制
                     try:
@@ -2986,8 +3263,12 @@ class EnhancedStrategy(bt.Strategy):
 
         # 初始化通知器
         self.notifier = None
-        if self.trading_params and self.trading_params.serverchan_sendkey:
-            self.notifier = ServerChanNotifier(self.trading_params.serverchan_sendkey)
+        if self.trading_params and (self.trading_params.serverchan_sendkey or self.trading_params.wecom_webhook_url):
+            self.notifier = ServerChanNotifier(
+                self.trading_params.serverchan_sendkey,
+                wecom_webhook_url=self.trading_params.wecom_webhook_url,
+                serverchan_channel=self.trading_params.serverchan_channel,
+            )
             self.log("Server酱通知器已初始化", level="INFO")
 
     @property
@@ -3380,15 +3661,19 @@ class EnhancedStrategy(bt.Strategy):
             if hasattr(self, 'position_manager'):
                 self.position_manager._check_position_reset()
 
-        # ========== 5. 定期账户状态输出（每100个bar）==========
-        if len(self.data) % 100 == 0:
-            total_value = self.broker.getvalue()
-            cash = self.broker.get_cash()
-            position_value = self.position.size * self.data.close[0] if self.position else 0
+        # ========== 5. 定期账户状态输出（可关闭/按参数频率）==========
+        if ParamAccessor.get_param(self, 'enable_periodic_account_log', False):
+            interval_bars = max(1, ParamAccessor.get_param(self, 'periodic_log_interval_bars', 100))
+            if len(self.data) % interval_bars == 0:
+                total_value = self.broker.getvalue()
+                cash = self.broker.get_cash()
+                position_value = self.position.size * self.data.close[0] if self.position else 0
 
-            self.log(f"账户状态 - 总价值:${total_value:.2f}, 现金:${cash:.2f}, "
+                self.log(
+                    f"账户状态 - 总价值:${total_value:.2f}, 现金:${cash:.2f}, "
                     f"持仓价值:${position_value:.2f}, 持仓数量:{self.position.size if self.position else 0}",
-                    level="CRITICAL")
+                    level="CRITICAL"
+                )
 
         # ========== 6. 定期风险状态重置（每365个bar）==========
         if len(self.data) % 365 == 0:
@@ -3468,6 +3753,25 @@ class EnhancedStrategy(bt.Strategy):
                     daily_return = (self.portfolio_values[-1] / self.portfolio_values[-2] - 1)
                     self.daily_returns.append(daily_return)
 
+            # 当日亏损保护（仅日内模式）- 每个交易日最多触发一次，需在每日任意bar评估
+            try:
+                if self.trading_params.intraday_mode and hasattr(self, 'daily_value') and self.daily_value:
+                    port_now = self.broker.getvalue()
+                    day_ret = (port_now / self.daily_value - 1.0)
+                    guard_pct = ParamAccessor.get_param(self, 'daily_loss_guard_pct')
+                    if (day_ret < -abs(guard_pct)
+                        and self.position and self.position.size > 0
+                        and getattr(self, '_last_daily_guard_date', None) != current_date):
+                        sell_ratio = ParamAccessor.get_param(self, 'daily_loss_guard_sell_ratio')
+                        trim = max(ParamAccessor.get_param(self, 'min_meaningful_shares'), int(self.position.size * sell_ratio))
+                        if trim > 0:
+                            self.log(f"当日亏损保护触发：日内回撤{day_ret:.1%}，减仓{trim}", level="CRITICAL")
+                            self.order = self.sell(size=trim)
+                            self._last_daily_guard_date = current_date
+                            return
+            except Exception:
+                pass
+
             # ========== 14. 更新市场状态 ==========
             market_regime = self.market_state.get_market_regime()
             trend_strength = self.market_state.get_trend_strength()
@@ -3514,7 +3818,19 @@ class EnhancedStrategy(bt.Strategy):
 
                 # 16.4 执行建议的操作（容错：position_action 可能为None）
                 if not position_action:
-                    # 无操作建议，退出本周期
+                    # 无操作建议：若长时间无交易且处于可操作区间，允许触发微量再平衡，避免“后半段无交易”
+                    try:
+                        stagnation_bars = ParamAccessor.get_param(self, 'stagnation_relax_bars')
+                        if hasattr(self, 'last_trade_bar') and (len(self) - self.last_trade_bar) >= stagnation_bars:
+                            # 若趋势强且现金充足，尝试小额增持至目标（限额）
+                            size_hint = int(self.broker.get_cash() / self.data.close[0] * 0.05)
+                            if size_hint > 0:
+                                self.log("久未交易微量再平衡：买入", level="INFO")
+                                self.order = self.buy(size=size_hint)
+                                self.last_trade_bar = len(self)
+                                return
+                    except Exception:
+                        pass
                     return
 
                 action = position_action.get('action')
@@ -3564,9 +3880,11 @@ class EnhancedStrategy(bt.Strategy):
 
                 # 16.7 检查买入信号（使用新的激进方法）
                 base_buy = self.market_state.get_buy_signal()
-                # 添加调试信息
-                if len(self) % 100 == 0:  # 每100个bar输出一次
-                    self.log(f"买入信号检查 - base_buy: {base_buy}, 当前价: {current_price:.2f}", level="CRITICAL")
+                # 可选：定期打印买入信号检查
+                if ParamAccessor.get_param(self, 'enable_periodic_signal_log', False):
+                    interval_bars = max(1, ParamAccessor.get_param(self, 'periodic_log_interval_bars', 100))
+                    if len(self) % interval_bars == 0:
+                        self.log(f"买入信号检查 - base_buy: {base_buy}, 当前价: {current_price:.2f}", level="CRITICAL")
 
                 # 16.8 检查市场恢复（保持原有逻辑）
                 if hasattr(self, '_last_crash_bar'):
@@ -3575,8 +3893,10 @@ class EnhancedStrategy(bt.Strategy):
 
                 # 16.9 检查回调条件
                 dip_signal = self.position_manager._should_buy_the_dip(current_price)
-                if len(self) % 100 == 0:  # 每100个bar输出一次
-                    self.log(f"回调信号检查 - dip_signal: {dip_signal}", level="CRITICAL")
+                if ParamAccessor.get_param(self, 'enable_periodic_signal_log', False):
+                    interval_bars = max(1, ParamAccessor.get_param(self, 'periodic_log_interval_bars', 100))
+                    if len(self) % interval_bars == 0:
+                        self.log(f"回调信号检查 - dip_signal: {dip_signal}", level="CRITICAL")
 
                 # 16.11 构建信号来源
                 signal_source = []
@@ -3639,8 +3959,12 @@ class EnhancedStrategy(bt.Strategy):
                     self.trade_manager = TradeManager()
                     self.trade_manager.set_strategy(self)
 
-                # 获取当前交易日期
+                # 获取当前交易日期与精确时间
                 current_date = self.data.datetime.date(0)
+                try:
+                    current_dt = self.data.datetime.datetime(0)
+                except Exception:
+                    current_dt = pd.Timestamp(current_date).to_pydatetime()
                 if isinstance(current_date, (int, float)):
                     current_date = pd.Timestamp(datetime.datetime.fromordinal(int(current_date)))
                 elif isinstance(current_date, datetime.date):
@@ -3655,13 +3979,17 @@ class EnhancedStrategy(bt.Strategy):
                     # 记录买入交易
                     trade_dict = {
                         'entry_date': current_date,
+                        'entry_dt': current_dt,
+                        'entry_bar': len(self),
                         'entry_price': executed_price,
                         'exit_date': None,
                         'exit_price': None,
                         'size': executed_size,
                         'orig_size': executed_size,
                         'commission': executed_comm,
-                        'pnl': -executed_comm,
+                        # 进场不计入负pnl，避免统计被误当作亏损交易
+                        'pnl': 0.0,
+                        'commission_remaining': executed_comm,
                         'type': 'entry',
                         'status': 'open'
                     }
@@ -3747,8 +4075,18 @@ class EnhancedStrategy(bt.Strategy):
                             # 计算本次平仓数量
                             close_size = min(open_trade['size'], remaining_to_close)
 
-                            # 计算盈亏
-                            trade_pnl = (executed_price - open_trade['entry_price']) * close_size
+                            # 计算盈亏，按比例分摊进场手续费
+                            entry_price_ot = open_trade['entry_price']
+                            trade_pnl = (executed_price - entry_price_ot) * close_size
+                            try:
+                                commission_rem = float(open_trade.get('commission_remaining', open_trade.get('commission', 0.0)) or 0.0)
+                                orig_size = float(open_trade.get('orig_size', open_trade['size']) or 1)
+                                proportion = close_size / orig_size
+                                entry_comm_share = min(commission_rem, (open_trade.get('commission', 0.0) or 0.0) * proportion)
+                                trade_pnl -= entry_comm_share
+                                open_trade['commission_remaining'] = max(0.0, commission_rem - entry_comm_share)
+                            except Exception:
+                                pass
                             total_pnl += trade_pnl
 
                             # 更新加权平均入场价
@@ -3775,6 +4113,8 @@ class EnhancedStrategy(bt.Strategy):
                             'entry_date': getattr(self, 'entry_time', current_date),
                             'entry_price': avg_entry_price,
                             'exit_date': current_date,
+                            'exit_dt': current_dt,
+                            'exit_bar': len(self),
                             'exit_price': executed_price,
                             'size': executed_size,
                             'commission': executed_comm,
@@ -3814,6 +4154,8 @@ class EnhancedStrategy(bt.Strategy):
                             'entry_date': getattr(self, 'entry_time', current_date),
                             'entry_price': entry_price,
                             'exit_date': current_date,
+                            'exit_dt': current_dt,
+                            'exit_bar': len(self),
                             'exit_price': executed_price,
                             'size': executed_size,
                             'commission': executed_comm,
@@ -3936,7 +4278,7 @@ class EnhancedStrategy(bt.Strategy):
 class ServerChanNotifier:
     """Server酱微信通知器"""
 
-    def __init__(self, sendkey: str):
+    def __init__(self, sendkey: str, wecom_webhook_url: str = "", serverchan_channel: str = ""):
         """
         初始化通知器
         参数:
@@ -3944,34 +4286,49 @@ class ServerChanNotifier:
         """
         self.sendkey = sendkey
         self.base_url = "https://sctapi.ftqq.com"
-        self.enabled = bool(sendkey)
+        self.enabled = bool(sendkey) or bool(wecom_webhook_url)
+        self.wecom_webhook_url = wecom_webhook_url
+        self.serverchan_channel = serverchan_channel
 
     def send_message(self, title: str, content: str = "") -> bool:
-        """发送消息到微信"""
+        """发送消息：优先企业微信群机器人，其次Server酱。"""
         if not self.enabled:
             return False
 
-        try:
-            url = f"{self.base_url}/{self.sendkey}.send"
-            data = {
-                "title": title,
-                "desp": content
-            }
+        sent = False
+        # 1) 企业微信群机器人
+        if self.wecom_webhook_url:
+            try:
+                headers = {"Content-Type": "application/json"}
+                payload = {
+                    "msgtype": "markdown",
+                    "markdown": {"content": f"**{title}**\n{content}"}
+                }
+                r = requests.post(self.wecom_webhook_url, headers=headers, data=json.dumps(payload), timeout=10)
+                r.raise_for_status()
+                print(f"[通知] 企业微信群机器人发送成功: {title}")
+                sent = True
+            except Exception as e:
+                print(f"[通知] 企业微信群机器人发送失败: {str(e)}")
 
-            response = requests.post(url, data=data, timeout=10)
-            response.raise_for_status()
-
-            result = response.json()
-            if result.get("code") == 0:
-                print(f"[通知] 消息发送成功: {title}")
-                return True
-            else:
-                print(f"[通知] 消息发送失败: {result.get('message', 'Unknown error')}")
-                return False
-
-        except Exception as e:
-            print(f"[通知] 发送消息时出错: {str(e)}")
-            return False
+        # 2) Server酱（可选指定channel）
+        if self.sendkey:
+            try:
+                url = f"{self.base_url}/{self.sendkey}.send"
+                data = {"title": title, "desp": content}
+                if self.serverchan_channel:
+                    data["channel"] = self.serverchan_channel
+                response = requests.post(url, data=data, timeout=10)
+                response.raise_for_status()
+                result = response.json()
+                if result.get("code") == 0:
+                    print(f"[通知] 消息发送成功: {title}")
+                    sent = True or sent
+                else:
+                    print(f"[通知] 消息发送失败: {result.get('message', 'Unknown error')}")
+            except Exception as e:
+                print(f"[通知] 发送消息时出错: {str(e)}")
+        return sent
 
     def send_trade_alert(self, action: str, symbol: str, price: float,
                         size: int, pnl: Optional[float] = None) -> bool:
@@ -3991,8 +4348,6 @@ class ServerChanNotifier:
             content += f"- **盈亏**: ${pnl:+.2f}\n"
 
         return self.send_message(title, content)
-
-
 
     def _load(self):
         """加载数据到backtrader"""
@@ -4252,8 +4607,8 @@ class SimpleLiveDataFeed(bt.feeds.DataBase):
         if self._last_dummy_time is None:
             self._last_dummy_time = now
         
-        # 每小时（3600秒）检查一次新数据，而不是每60秒
-        check_interval = 3600  # 1小时
+        # 每6分钟（360秒）检查一次新数据，而不是每60秒
+        check_interval = 360  # 6分钟
         
         # 检查是否需要获取新数据
         if self.last_update is None or (now - self.last_update).seconds >= check_interval:
@@ -4433,26 +4788,30 @@ class TradeAnalyzer:
             '净收益': final_value - initial_value,
             '收益率': total_return * 100,
             '年化收益率': annual_return,
+            '回测交易天数': approx_days,
         }
         # 获取所有交易（包括未平仓）
         all_trades = trade_manager.executed_trades
         entry_trades = [t for t in all_trades if t.get('type') == 'entry']
-        exit_trades = [t for t in all_trades if t.get('type') == 'exit']  # 新增
-        closed_trades = [t for t in all_trades if t.get('status') == 'closed']
+        exit_trades = [t for t in all_trades if t.get('type') == 'exit']
+        # 仅使用 exit 交易进行胜率/收益统计，避免将FIFO关闭的entry记录（pnl=0）计入
+        closed_exits = exit_trades
 
         # 交易统计
-        if entry_trades:
-            winning_trades = sum(1 for t in closed_trades if t.get('pnl', 0) > 0) if closed_trades else 0
-            total_pnl = sum(t.get('pnl', 0) for t in closed_trades) if closed_trades else 0
+        if exit_trades:
+            # 只以有意义的平仓为样本（过滤掉极小成交/手续费近似为0的边缘交易）
+            meaningful_exits = [t for t in closed_exits if abs(t.get('pnl', 0)) >= 1e-6 or (t.get('size', 0) or 0) >= 1]
+            winning_trades = sum(1 for t in meaningful_exits if t.get('pnl', 0) > 0) if meaningful_exits else 0
+            total_pnl = sum(t.get('pnl', 0) for t in meaningful_exits) if meaningful_exits else 0
             
             stats['交易统计'] = {
-                '总交易次数': len(entry_trades),  # 使用entry_trades
-                '已平仓次数': len(closed_trades),
-                '未平仓次数': len(entry_trades) - len(closed_trades),
-                '胜率': (winning_trades / len(closed_trades) * 100) if closed_trades else 0,
-                '平均每笔收益': total_pnl / len(closed_trades) if closed_trades else 0,
-                '最大单笔收益': max((t.get('pnl', 0) for t in closed_trades), default=0),
-                '最大单笔亏损': min((t.get('pnl', 0) for t in closed_trades), default=0),
+                '总交易次数': len(meaningful_exits),
+                '已平仓次数': len(meaningful_exits),
+                '未平仓次数': max(0, len(entry_trades) - len(meaningful_exits)),
+                '胜率': (winning_trades / len(meaningful_exits) * 100) if meaningful_exits else 0,
+                '平均每笔收益': total_pnl / len(meaningful_exits) if meaningful_exits else 0,
+                '最大单笔收益': max((t.get('pnl', 0) for t in meaningful_exits), default=0),
+                '最大单笔亏损': min((t.get('pnl', 0) for t in meaningful_exits), default=0),
             }
         else:
             stats['交易统计'] = {
@@ -4480,21 +4839,50 @@ class TradeAnalyzer:
                     daily_returns = returns_all
             else:
                 daily_returns = returns_all
-            volatility = np.std(daily_returns) * np.sqrt(252)
+            # 使用更稳健的波动率估计（样本标准差，偏度修正），并做winsorize裁剪极值
+            try:
+                dr = np.array(daily_returns)
+                if len(dr) > 10:
+                    low, high = np.percentile(dr, [1, 99])
+                    dr = np.clip(dr, low, high)
+                volatility = np.std(dr, ddof=1) * np.sqrt(252)
+            except Exception:
+                volatility = np.std(daily_returns) * np.sqrt(252)
+            
+            # 计算夏普比率、索提诺比率和最差单日收益（这些应该在try-except块之外）
             sharpe_ratio = TradeAnalyzer._calculate_sharpe_ratio(daily_returns)
             sortino_ratio = TradeAnalyzer._calculate_sortino_ratio(daily_returns)
+            worst_daily_return_pct = float(np.min(daily_returns) * 100) if len(daily_returns) > 0 else 0.0
         else:
             volatility = 0
             sharpe_ratio = 0
             sortino_ratio = 0
+            worst_daily_return_pct = 0.0
 
-        max_drawdown = TradeAnalyzer._calculate_max_drawdown(strategy)
+        # 计算最大回撤时，先做日度聚合，避免小时级噪音误差放大
+        try:
+            if intraday_mode and len(portfolio_values) > intraday_multiplier:
+                mult = max(1, int(intraday_multiplier))
+                steps = len(portfolio_values) // mult
+                pv = portfolio_values[:steps * mult].reshape(steps, mult)
+                pv_daily = pv[:, -1]
+                tmp_strategy = strategy
+                # 临时替换以复用函数
+                saved = tmp_strategy.portfolio_values
+                tmp_strategy.portfolio_values = pv_daily.tolist()
+                max_drawdown = TradeAnalyzer._calculate_max_drawdown(tmp_strategy)
+                tmp_strategy.portfolio_values = saved
+            else:
+                max_drawdown = TradeAnalyzer._calculate_max_drawdown(strategy)
+        except Exception:
+            max_drawdown = TradeAnalyzer._calculate_max_drawdown(strategy)
 
         stats['风险统计'] = {
             '最大回撤': max_drawdown * 100,
             '收益波动率': volatility * 100,
             '夏普比率': sharpe_ratio,
             'Sortino比率': sortino_ratio,
+            '最差单日收益': worst_daily_return_pct,
         }
 
         # Position information
@@ -5064,8 +5452,8 @@ class TradeVisualizer:
                     if buy_size <= 0:
                         continue
 
-                comm = float(trade.get('commission', 0.0))
-                daily_pnl = -comm
+                # 为保持“Total P&L”为已实现盈亏，买入行的 Daily P&L 置为 0（买入手续费在卖出时分摊计入）
+                daily_pnl = 0.0
                 trade_records.append({
                     'Date': str(b_date),
                     'Type': 'B',
@@ -5080,6 +5468,9 @@ class TradeVisualizer:
                     continue
                 sell_price = float(trade.get('exit_price', 0.0))
                 sell_size  = trade.get('size', 0)
+                # 以 exit 为主序，先按bar/时间排序，防止同日多次交易导致显示错序
+                exit_dt = trade.get('exit_dt')
+                exit_bar = trade.get('exit_bar', 10**12)
                 realized_pnl = float(trade.get('pnl', 0.0))
                 updated_pnl  = running_pnl + realized_pnl
                 trade_records.append({
@@ -5088,12 +5479,26 @@ class TradeVisualizer:
                     'Size': sell_size,
                     'Price': sell_price,
                     'Daily P&L': realized_pnl,
-                    'Total P&L': updated_pnl
+                    'Total P&L': updated_pnl,
+                    '_exit_bar': exit_bar,
+                    '_exit_dt': str(exit_dt) if exit_dt else ''
                 })
                 running_pnl = updated_pnl
         
-        # 按交易日期排序
-        trade_records.sort(key=lambda r: pd.to_datetime(r['Date']))
+        # 排序：优先 exit 的 bar 序，然后按日期
+        def _sort_key(r):
+            if r.get('Type') == 'S':
+                return (0, r.get('_exit_bar', 10**12))
+            # 买单按出现顺序靠前，避免“Total P&L”被后来的买单穿插显示为0
+            return (1, pd.to_datetime(r['Date']))
+        trade_records.sort(key=_sort_key)
+
+        # 关键修复：在排序后重新累计 Total P&L（仅累加卖出行的 Daily P&L）
+        running = 0.0
+        for rec in trade_records:
+            if rec.get('Type') == 'S':
+                running += float(rec.get('Daily P&L', 0.0) or 0.0)
+            rec['Total P&L'] = running
         
         return trade_records
 
@@ -5432,18 +5837,35 @@ class SimpleTradingMonitor:
                                 )
                             last_position_check = current_position
 
-                        # 定期状态报告（每30分钟）
-                        if not hasattr(self, '_last_full_report') or (now - self._last_full_report).seconds >= 1800:
+                        # 定期状态报告（按参数间隔）
+                        if not hasattr(self, '_last_full_report') or (now - self._last_full_report).seconds >= int(getattr(self.strategy_params, 'heartbeat_interval_seconds', 1800)):
                             session, tradable = get_market_session(now, include_prepost=getattr(self.strategy_params, 'prepost', True))
-                            status_msg = f"""
-                                    [{now.strftime('%Y-%m-%d %H:%M:%S %Z')}] 系统状态报告
-                                    - 账户总值: ${portfolio_value:,.2f}
-                                    - 可用现金: ${cash:,.2f}
-                                    - 当前持仓: {current_position}股
-                                    - 当前价格: ${current_price:.2f}
-                                    - 会话: {session} | 交易时间: {'是' if tradable else '否'}
-                                    - 会话规则: {'包含盘前/盘后' if getattr(self.strategy_params, 'prepost', True) else '仅常规时段'}
-                                    """
+                            session_map = {"pre": "盘前", "regular": "常规", "after": "盘后", "closed": "休市"}
+                            session_human = session_map.get(session, session)
+                            # 计算总收益/当日收益
+                            try:
+                                initial_cash = self.strategy_params.initial_cash
+                                total_ret = portfolio_value / initial_cash - 1
+                            except Exception:
+                                total_ret = 0.0
+                            try:
+                                if hasattr(self.strategy_params, 'strategy') and hasattr(self.strategy_params.strategy, 'daily_value') and self.strategy_params.strategy.daily_value:
+                                    day_ret = portfolio_value / self.strategy_params.strategy.daily_value - 1
+                                else:
+                                    day_ret = 0.0
+                            except Exception:
+                                day_ret = 0.0
+
+                            status_msg = (
+                                f"[{now.strftime('%Y-%m-%d %H:%M:%S %Z')}] 系统状态报告\n"
+                                f"- 账户总值: ${portfolio_value:,.2f}\n"
+                                f"- 可用现金: ${cash:,.2f}\n"
+                                f"- 当前持仓: {current_position}股\n"
+                                f"- 当前价格: ${current_price:.2f}\n"
+                                f"- 当日: {day_ret*100:.2f}% | 总收益: {total_ret*100:.2f}%\n"
+                                f"- 会话: {session_human} | 交易时间: {'是' if tradable else '否'}\n"
+                                f"- 会话规则: {'包含盘前/盘后' if getattr(self.strategy_params, 'prepost', True) else '仅常规时段'}"
+                            )
                             print(status_msg)
                             self._last_full_report = now
 
@@ -5604,12 +6026,17 @@ def main():
             provider_choice = ""
         if symbol in ['NVDA', 'AMD', 'TSLA', 'COIN', 'PLTR']:
             print(f"\n提示：{symbol} 是2025年热门股票，使用激进策略参数")
-        initial_cash_str = input("输入初始资金（例如：100000） [默认: 100000]: ").strip() or "100000"
-        initial_cash = float(initial_cash_str)
 
         # 新增：询问是否为实时模式
         live_mode_input = input("是否启用实时交易模式? y/n (默认n): ").strip().lower()
         live_mode = (live_mode_input == 'y')
+
+        # 实时模式：固定初始资金10,000；回测模式：保留可输入，默认100,000
+        if live_mode:
+            initial_cash = 10000.0
+        else:
+            initial_cash_str = input("输入初始资金（例如：100000） [默认: 100000]: ").strip() or "100000"
+            initial_cash = float(initial_cash_str)
 
 
         serverchan_key = "SCT119824TW3DsGlBjkhAV9lJWIOLohv1P"
@@ -5618,7 +6045,7 @@ def main():
         TWELVE_DATA_API_KEY = "4e06770f76fe42b9bc3b6760b14118f6"
 
         # 日期设置
-        generate_live_report = False  # 默认值
+        generate_live_report = False  # 默认不在实时后生成回测报告
         if live_mode:
             # 实时模式：允许用户指定历史数据长度
             history_days_input = input("输入历史数据天数（默认365天）: ").strip() or "365"
@@ -5628,9 +6055,8 @@ def main():
             start_date = (datetime.datetime.now() - datetime.timedelta(days=history_days)).strftime("%Y-%m-%d")
             print(f"\n实时模式：加载从 {start_date} 到 {end_date} 的历史数据")
 
-            # 询问是否在实时运行后生成回测报告
-            generate_report = input("实时运行结束后是否生成历史回测报告? y/n (默认y): ").strip().lower() or "y"
-            generate_live_report = (generate_report == 'y')
+            # 实时模式不生成历史回测报告
+            generate_live_report = False
 
             interval_input = "1h"
             include_prepost_input = input("是否包含盘前/盘后交易? y/n (默认y): ").strip().lower() or "y"
@@ -5669,7 +6095,11 @@ def main():
         # 创建通知器（提前创建以便在数据下载阶段也能使用）
         notifier = None
         if trading_params.serverchan_sendkey:
-            notifier = ServerChanNotifier(trading_params.serverchan_sendkey)
+            notifier = ServerChanNotifier(
+                trading_params.serverchan_sendkey,
+                wecom_webhook_url=trading_params.wecom_webhook_url,
+                serverchan_channel=trading_params.serverchan_channel,
+            )
             print("Server酱通知已启用")
 
         # ===== 数据获取部分 =====
@@ -6127,22 +6557,55 @@ def main():
 
                 # 启动通知已由 Monitor.start() 统一发送
 
-                # 实时模式：保持运行
+                # 实时模式：保持运行（仅主循环推送心跳，监控线程不重复推送）
                 last_status_time = datetime.datetime.now()
-                status_interval = 60
+                status_interval = int(trading_params.heartbeat_interval_seconds)
                 while True:
                     try:
                         now = datetime.datetime.now()
 
                         # 定期输出状态信息
                         if (now - last_status_time).seconds >= status_interval:
-                            # 检查是否在交易时间，并输出会话类型
+                            # 检查是否在交易时间，并输出会话类型（同时推送到通知渠道，便于远程查看）
                             session, tradable = get_market_session(now, include_prepost=trading_params.prepost)
                             is_trading = tradable if monitor else False
+                            # 构造更友好的会话文案
+                            session_map = {"pre": "盘前", "regular": "常规", "after": "盘后", "closed": "休市"}
+                            session_human = session_map.get(session, session)
                             status_msg = f"[{now.strftime('%Y-%m-%d %H:%M:%S %Z')}] 系统运行中 - "
-                            status_msg += ("交易时间" if is_trading else "非交易时间") + f"（会话: {session}）"
+                            status_msg += ("交易时间" if is_trading else "非交易时间") + f"（会话: {session_human}）"
 
                             print(status_msg)
+                            # 心跳推送（按配置的间隔）
+                            if notifier:
+                                # 组装简略收益信息
+                                extra = f"会话规则: {'包含盘前/盘后' if trading_params.prepost else '仅常规时段'}"
+                                if getattr(trading_params, 'heartbeat_include_returns', True):
+                                    try:
+                                        # 当前价格
+                                        current_price = strategy.data.close[0]
+                                        # 账户与收益
+                                        portfolio_value = strategy.broker.getvalue()
+                                        initial_cash = trading_params.initial_cash
+                                        total_ret = portfolio_value / initial_cash - 1
+                                        # 当日收益（基于daily_values或最近两个portfolio_values近似）
+                                        if hasattr(strategy, 'daily_value') and strategy.daily_value:
+                                            day_ret = portfolio_value / strategy.daily_value - 1
+                                        elif len(strategy.portfolio_values) >= 2:
+                                            pv = strategy.portfolio_values
+                                            day_ret = pv[-1] / pv[-2] - 1
+                                        else:
+                                            day_ret = 0.0
+                                        extra = (
+                                            f"{extra}\n价格: ${current_price:.2f} | 当日: {day_ret*100:.2f}% | 总收益: {total_ret*100:.2f}%"
+                                        )
+                                    except Exception:
+                                        pass
+
+                                notifier.send_message(
+                                    "系统心跳",
+                                    f"{status_msg}\n{extra}"
+                                )
                             last_status_time = now
 
                         time.sleep(60)  # 每分钟检查一次
