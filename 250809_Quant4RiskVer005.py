@@ -316,6 +316,12 @@ class TradingParameters:
     # 心跳/推送配置
     heartbeat_interval_seconds: int = 1800  # 系统心跳推送间隔（默认30分钟）
     heartbeat_include_returns: bool = True  # 心跳是否包含价格/当日/总收益率
+    # 分渠道心跳配置
+    enable_serverchan_hourly_heartbeat: bool = True
+    serverchan_heartbeat_seconds: int = 3600  # Server酱每小时
+    enable_wecom_daily_heartbeat: bool = True
+    wecom_daily_heartbeat_hour_local: int = 10   # Asia/Shanghai 本地小时
+    wecom_daily_heartbeat_minute_local: int = 15 # Asia/Shanghai 本地分钟
 
     # 实时运行日志节流
     enable_periodic_signal_log: bool = False   # 是否定期打印信号检查（默认关闭）
@@ -3539,6 +3545,8 @@ class EnhancedStrategy(bt.Strategy):
             self.log(f'数据状态: {status_name}', level="INFO")
 
             if status == data.LIVE:
+                # 标记已进入真实实时数据阶段
+                self._is_live = True
                 self.log("策略已切换至实时数据模式", level="INFO")
                 if self.notifier:
                     # 检查是否真的是实时数据
@@ -3559,6 +3567,19 @@ class EnhancedStrategy(bt.Strategy):
             if len(self) % 10 == 0:
                 self.log(f"数据积累中 - 当前: {len(self)}/{min_required_bars}", level="DEBUG")
             return
+
+        # 实时模式：在数据未进入LIVE之前不执行交易，以免历史预热期间触发交易
+        try:
+            if getattr(self.trading_params, 'live_mode', False):
+                if not hasattr(self, '_is_live'):
+                    self._is_live = False
+                if not self._is_live:
+                    current_price = self.data.close[0]
+                    self.risk_manager.update_tracking(current_price, self.broker.getvalue())
+                    self.portfolio_values.append(self.broker.getvalue())
+                    return
+        except Exception:
+            pass
         
         # ===== 关键修复：确保指标真正初始化 =====
         if not hasattr(self, '_indicators_initialized') or not self._indicators_initialized:
@@ -4330,6 +4351,46 @@ class ServerChanNotifier:
                 print(f"[通知] 发送消息时出错: {str(e)}")
         return sent
 
+    def send_message_wecom(self, title: str, content: str = "") -> bool:
+        """仅向企业微信群机器人发送一条消息。"""
+        if not self.wecom_webhook_url:
+            return False
+        try:
+            headers = {"Content-Type": "application/json"}
+            payload = {
+                "msgtype": "markdown",
+                "markdown": {"content": f"**{title}**\n{content}"}
+            }
+            r = requests.post(self.wecom_webhook_url, headers=headers, data=json.dumps(payload), timeout=10)
+            r.raise_for_status()
+            print(f"[通知] 企业微信群机器人发送成功: {title}")
+            return True
+        except Exception as e:
+            print(f"[通知] 企业微信群机器人发送失败: {str(e)}")
+            return False
+
+    def send_message_serverchan(self, title: str, content: str = "") -> bool:
+        """仅向Server酱服务号发送一条消息。"""
+        if not self.sendkey:
+            return False
+        try:
+            url = f"{self.base_url}/{self.sendkey}.send"
+            data = {"title": title, "desp": content}
+            if self.serverchan_channel:
+                data["channel"] = self.serverchan_channel
+            response = requests.post(url, data=data, timeout=10)
+            response.raise_for_status()
+            result = response.json()
+            if result.get("code") == 0:
+                print(f"[通知] 消息发送成功: {title}")
+                return True
+            else:
+                print(f"[通知] 消息发送失败: {result.get('message', 'Unknown error')}")
+                return False
+        except Exception as e:
+            print(f"[通知] 发送消息时出错: {str(e)}")
+            return False
+
     def send_trade_alert(self, action: str, symbol: str, price: float,
                         size: int, pnl: Optional[float] = None) -> bool:
         """发送交易提醒"""
@@ -4523,7 +4584,7 @@ class SimpleLiveDataFeed(bt.feeds.DataBase):
                 self._use_external_data()
                 if len(self.hist_data) == 0:
                     print("错误：无法加载历史数据")
-                    return False
+                    return None
             
             # 加载历史数据
             if self.hist_index < len(self.hist_data):
@@ -4553,7 +4614,7 @@ class SimpleLiveDataFeed(bt.feeds.DataBase):
             print(f"_load错误: {str(e)}")
             import traceback
             traceback.print_exc()
-            return False
+            return None
 
     def _set_data_lines(self, data):
         """安全地设置数据线"""
@@ -5764,7 +5825,8 @@ class SimpleTradingMonitor:
                         📊 当日盈亏: ${daily_pnl:+,.2f} ({daily_pnl_pct:+.1f}%)
                         ━━━━━━━━━━━━━━━
                         """
-            self.notifier.send_message("每日交易总结", summary_msg)
+            # 每日总结仅通过企业微信发送，避免服务号打扰
+            self.notifier.send_message_wecom("每日交易总结", summary_msg)
             self._last_portfolio_value = portfolio_value
             
         except Exception as e:
@@ -6560,6 +6622,8 @@ def main():
                 # 实时模式：保持运行（仅主循环推送心跳，监控线程不重复推送）
                 last_status_time = datetime.datetime.now()
                 status_interval = int(trading_params.heartbeat_interval_seconds)
+                last_serverchan_hb = datetime.datetime.now() - datetime.timedelta(hours=1)
+                last_wecom_hb_date = None
                 while True:
                     try:
                         now = datetime.datetime.now()
@@ -6576,19 +6640,16 @@ def main():
                             status_msg += ("交易时间" if is_trading else "非交易时间") + f"（会话: {session_human}）"
 
                             print(status_msg)
-                            # 心跳推送（按配置的间隔）
+                            # 心跳推送（分渠道频率）
                             if notifier:
-                                # 组装简略收益信息
+                                # 组装心跳内容
                                 extra = f"会话规则: {'包含盘前/盘后' if trading_params.prepost else '仅常规时段'}"
                                 if getattr(trading_params, 'heartbeat_include_returns', True):
                                     try:
-                                        # 当前价格
                                         current_price = strategy.data.close[0]
-                                        # 账户与收益
                                         portfolio_value = strategy.broker.getvalue()
                                         initial_cash = trading_params.initial_cash
                                         total_ret = portfolio_value / initial_cash - 1
-                                        # 当日收益（基于daily_values或最近两个portfolio_values近似）
                                         if hasattr(strategy, 'daily_value') and strategy.daily_value:
                                             day_ret = portfolio_value / strategy.daily_value - 1
                                         elif len(strategy.portfolio_values) >= 2:
@@ -6597,15 +6658,37 @@ def main():
                                         else:
                                             day_ret = 0.0
                                         extra = (
-                                            f"{extra}\n价格: ${current_price:.2f} | 当日: {day_ret*100:.2f}% | 总收益: {total_ret*100:.2f}%"
+                                            f"{extra}\n标的: {trading_params.symbol} | 价格: ${current_price:.2f}\n当日: {day_ret*100:.2f}% | 总收益: {total_ret*100:.2f}%"
                                         )
                                     except Exception:
                                         pass
 
-                                notifier.send_message(
-                                    "系统心跳",
-                                    f"{status_msg}\n{extra}"
-                                )
+                                # Server酱：每小时一次
+                                if getattr(trading_params, 'enable_serverchan_hourly_heartbeat', True):
+                                    sc_interval = int(getattr(trading_params, 'serverchan_heartbeat_seconds', 3600))
+                                    if (now - last_serverchan_hb).total_seconds() >= sc_interval:
+                                        notifier.send_message_serverchan(
+                                            "系统心跳",
+                                            f"{status_msg}\n{extra}"
+                                        )
+                                        last_serverchan_hb = now
+
+                                # 企业微信：每日一次（本地时区）
+                                if getattr(trading_params, 'enable_wecom_daily_heartbeat', True):
+                                    try:
+                                        tz = ZoneInfo("Asia/Shanghai")
+                                        now_cst = now.astimezone(tz)
+                                        target_h = int(getattr(trading_params, 'wecom_daily_heartbeat_hour_local', 10))
+                                        target_m = int(getattr(trading_params, 'wecom_daily_heartbeat_minute_local', 15))
+                                        if (now_cst.hour == target_h and now_cst.minute >= target_m):
+                                            if last_wecom_hb_date != now_cst.date():
+                                                notifier.send_message_wecom(
+                                                    "系统心跳（日更）",
+                                                    f"{status_msg}\n{extra}"
+                                                )
+                                                last_wecom_hb_date = now_cst.date()
+                                    except Exception:
+                                        pass
                             last_status_time = now
 
                         time.sleep(60)  # 每分钟检查一次
