@@ -15,9 +15,13 @@ import yfinance as yf
 import random
 import time
 import plotly.graph_objects as go
+import matplotlib
+matplotlib.use("Agg")  # 确保在无GUI环境下也能生成PNG
+import matplotlib.pyplot as plt
 import math
 import requests
 import json
+import base64
 import threading
 import queue
 import traceback
@@ -30,6 +34,112 @@ from zoneinfo import ZoneInfo
 import warnings
 
 _XNYS_SCHEDULE_CACHE: Dict[str, tuple] = {}
+
+def upload_image_imgbb(file_path: str, api_key: str, endpoint: str = "https://api.imgbb.com/1/upload") -> str:
+    """上传图片到 imgbb，返回图片URL；失败返回空串。
+    KISS：multipart + key + image(base64)，异常即返回空。
+    """
+    try:
+        with open(file_path, 'rb') as f:
+            encoded = base64.b64encode(f.read())
+        data = {
+            'key': api_key,
+            'image': encoded
+        }
+        r = requests.post(endpoint, data=data, timeout=30)
+        r.raise_for_status()
+        resp = r.json()
+        if resp.get('success') and resp.get('data', {}).get('url'):
+            return resp['data']['url']
+    except Exception:
+        pass
+    return ""
+
+def generate_backtest_visual_png(symbol: str,
+                                 start_str: str,
+                                 end_str: str,
+                                 interval: str,
+                                 initial_cash: float,
+                                 include_prepost: bool = True) -> tuple:
+    """运行一次轻量回测，使用TradeVisualizer生成高保真PNG。
+    返回 (png_path, stats_dict)。若失败，返回("", None)。
+    说明：需要kaleido方可输出Plotly PNG；若缺失会在日志提示。
+    """
+    try:
+        print(f"[每日总结] 回测(可视化) - 下载 {symbol} {interval} 数据: {start_str} ~ {end_str}")
+        df = yfinance_download(symbol=symbol, start=start_str, end=end_str, interval=interval, prepost=include_prepost)
+        # 兼容列名：统一到小写，日期列命名为 'date'
+        rename_map = {c: c.lower() for c in df.columns}
+        df = df.rename(columns=rename_map)
+        if 'datetime' in df.columns and 'date' not in df.columns:
+            df = df.rename(columns={'datetime': 'date'})
+        if 'date' not in df.columns:
+            raise Exception("历史数据缺少date列")
+        df['date'] = pd.to_datetime(df['date'])
+
+        # 构建回测
+        cerebro = bt.Cerebro()
+        params = TradingParameters(
+            symbol=symbol,
+            initial_cash=initial_cash,
+            start_date=start_str,
+            end_date=end_str,
+            data_interval=interval,
+            live_mode=False,
+            prepost=include_prepost,
+            exclude_premarket=not include_prepost,
+            exclude_afterhours=not include_prepost
+        )
+        cerebro.addstrategy(EnhancedStrategy, trading_params=params)
+        feed = bt.feeds.PandasData(
+            dataname=df,
+            datetime='date', open='open', high='high', low='low', close='close', volume='volume'
+        )
+        cerebro.adddata(feed)
+        cerebro.broker.setcommission(commission=params.commission)
+        cerebro.broker.set_slippage_fixed(params.slippage)
+        cerebro.broker.setcash(params.initial_cash)
+        strategies = cerebro.run()
+        if not strategies:
+            raise Exception("回测未得到策略实例")
+        strategy = strategies[0]
+        stats = TradeAnalyzer.calculate_statistics(strategy)
+        buy_hold = TradeAnalyzer.calculate_buy_hold_return(df, initial_cash)
+
+        # 使用已有TradeVisualizer生成图
+        # 将回测得到的交易明细注入到strategy.trade_manager，以便可视化器绘制买卖点
+        try:
+            if hasattr(strategy, 'trades') and hasattr(strategy.trades, 'executed_trades') and strategy.trades.executed_trades:
+                pass
+            elif hasattr(strategy, 'trade_manager') and hasattr(strategy.trade_manager, 'executed_trades') and strategy.trade_manager.executed_trades:
+                # 兼容命名：确保可视化使用的是同一容器
+                strategy.trades = strategy.trade_manager
+        except Exception:
+            pass
+
+        viz = TradeVisualizer(df=df.copy(), strategy=strategy, stats=stats, symbol=symbol, initial_cash=initial_cash, buy_hold_stats=buy_hold)
+        fig = viz.create_candlestick_chart()
+        # 提高分辨率（导出像素）
+        fig.update_layout(width=1920, height=1080)
+        # 将图片输出到 logs/daily_summary_screenshots
+        out_dir = os.path.join(os.getcwd(), 'logs', 'daily_summary_screenshots')
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except Exception:
+            pass
+        out_png = os.path.join(out_dir, f"summary_{symbol}_{end_str}.png")
+        try:
+            # 使用scale放大，获得更高像素的导出
+            fig.write_image(out_png, format='png', scale=2)
+            print("[每日总结] 使用TradeVisualizer+kaleido导出PNG成功")
+            return out_png, stats
+        except Exception as e:
+            print("[每日总结] 需安装kaleido以导出高保真图像：pip install -U kaleido")
+            print(f"[每日总结] 导出失败: {str(e)}")
+            return "", stats
+    except Exception as e:
+        print(f"[每日总结] 可视化回测失败: {str(e)}")
+        return "", None
 
 def get_market_session(dt_local: datetime.datetime, include_prepost: bool = True) -> tuple:
     """返回当前美股会话类型和是否视为可交易。
@@ -322,6 +432,25 @@ class TradingParameters:
     enable_wecom_daily_heartbeat: bool = True
     wecom_daily_heartbeat_hour_local: int = 10   # Asia/Shanghai 本地小时
     wecom_daily_heartbeat_minute_local: int = 15 # Asia/Shanghai 本地分钟
+
+    # 心跳专用渠道：仅用于限制心跳只发到服务号，避免企业微信收到小时心跳
+    # 说明：很多用户在Server酱后台把多个渠道（如服务号/企业微信群机器人）组合在一起，例如 "9|1"。
+    # 为避免心跳打扰企业微信，这里增加单独的心跳渠道覆盖。默认仅服务号（常见为'9'）。
+    serverchan_heartbeat_channel: str = "9"
+
+    # 是否在开始监控时立即发送一次“每日交易总结”（企业微信）
+    send_daily_summary_on_start: bool = True
+
+    # 外部健康检查心跳URL（healthchecks.io等），留空则不启用
+    healthcheck_ping_url: str = "https://hc-ping.com/df7b5083-70f5-4cd8-838c-550855ec88d5"
+
+    # 加速时钟（KISS）：>1 表示加速，例如 60 表示把 60 秒压缩为 1 秒；=1 表示真实时间
+    # 仅用于控制/监控循环等“等待类”sleep，网络重试与速率限制的sleep不受影响
+    time_scale: float = 1.0
+    # imgbb图床API Key（用于每日总结图表上传）
+    imgbb_api_key: str = "1a7c2fc0bf1a308ce82031f35a72d4b9"
+    # 每日总结用的“简易回测”初始资金（避免因实盘初始资金过小而不触发交易）
+    summary_backtest_initial_cash: float = 100000.0
 
     # 实时运行日志节流
     enable_periodic_signal_log: bool = False   # 是否定期打印信号检查（默认关闭）
@@ -4050,7 +4179,8 @@ class EnhancedStrategy(bt.Strategy):
                     if self.notifier and self.trading_params.enable_trade_notification:
                         # 检查是否是实时交易（数据时间接近当前时间）
                         current_data_time = self.data.datetime.datetime(0)
-                        now = datetime.datetime.now()
+                        # 使用本地 Asia/Shanghai 时区，避免误以为传入的是美东时区
+                        now = datetime.datetime.now(ZoneInfo("Asia/Shanghai"))
                         if (now - current_data_time).total_seconds() < 86400:  # 24小时内
                             self.notifier.send_trade_alert(
                                 action="买入",
@@ -4312,44 +4442,23 @@ class ServerChanNotifier:
         self.serverchan_channel = serverchan_channel
 
     def send_message(self, title: str, content: str = "") -> bool:
-        """发送消息：优先企业微信群机器人，其次Server酱。"""
+        """发送消息：优先发企业微信；若失败再回退到Server酱，避免重复推送。
+        - 这样企业微信不会再收到“带查看详情按钮”的Server酱转发。
+        """
         if not self.enabled:
             return False
 
-        sent = False
-        # 1) 企业微信群机器人
+        # 1) 优先企业微信
         if self.wecom_webhook_url:
-            try:
-                headers = {"Content-Type": "application/json"}
-                payload = {
-                    "msgtype": "markdown",
-                    "markdown": {"content": f"**{title}**\n{content}"}
-                }
-                r = requests.post(self.wecom_webhook_url, headers=headers, data=json.dumps(payload), timeout=10)
-                r.raise_for_status()
-                print(f"[通知] 企业微信群机器人发送成功: {title}")
-                sent = True
-            except Exception as e:
-                print(f"[通知] 企业微信群机器人发送失败: {str(e)}")
+            ok = self.send_message_wecom(title, content)
+            if ok:
+                return True
 
-        # 2) Server酱（可选指定channel）
+        # 2) 回退到Server酱（可选指定channel）
         if self.sendkey:
-            try:
-                url = f"{self.base_url}/{self.sendkey}.send"
-                data = {"title": title, "desp": content}
-                if self.serverchan_channel:
-                    data["channel"] = self.serverchan_channel
-                response = requests.post(url, data=data, timeout=10)
-                response.raise_for_status()
-                result = response.json()
-                if result.get("code") == 0:
-                    print(f"[通知] 消息发送成功: {title}")
-                    sent = True or sent
-                else:
-                    print(f"[通知] 消息发送失败: {result.get('message', 'Unknown error')}")
-            except Exception as e:
-                print(f"[通知] 发送消息时出错: {str(e)}")
-        return sent
+            return self.send_message_serverchan(title, content, channel=self.serverchan_channel)
+
+        return False
 
     def send_message_wecom(self, title: str, content: str = "") -> bool:
         """仅向企业微信群机器人发送一条消息。"""
@@ -4369,15 +4478,19 @@ class ServerChanNotifier:
             print(f"[通知] 企业微信群机器人发送失败: {str(e)}")
             return False
 
-    def send_message_serverchan(self, title: str, content: str = "") -> bool:
-        """仅向Server酱服务号发送一条消息。"""
+    def send_message_serverchan(self, title: str, content: str = "", channel: str = "") -> bool:
+        """仅向Server酱服务号发送一条消息。
+        参数 channel: 可选，覆盖默认的`serverchan_channel`，例如仅发到服务号'9'。
+        """
         if not self.sendkey:
             return False
         try:
             url = f"{self.base_url}/{self.sendkey}.send"
             data = {"title": title, "desp": content}
-            if self.serverchan_channel:
-                data["channel"] = self.serverchan_channel
+            # 优先使用调用时传入的channel，否则使用默认初始化时的channel
+            effective_channel = channel or self.serverchan_channel
+            if effective_channel:
+                data["channel"] = effective_channel
             response = requests.post(url, data=data, timeout=10)
             response.raise_for_status()
             result = response.json()
@@ -5768,10 +5881,27 @@ class SimpleTradingMonitor:
         self.monitor_thread.start()
 
         if self.notifier:
-            self.notifier.send_message(
-                "交易系统启动",
-                f"开始监控 {self.strategy_params.symbol}"
-            )
+            # 发送更详细的启动通知（企业微信优先，不回退Server酱）
+            try:
+                self._send_startup_notification()
+                # 并向Server酱服务号发送一条“后台通知”，便于你在服务号看到启动
+                try:
+                    hb_channel = getattr(self.strategy_params, 'serverchan_heartbeat_channel', '')
+                    self.notifier.send_message_serverchan(
+                        "实时交易系统启动",
+                        f"开始监控 {self.strategy_params.symbol}\n初始资金: ${self.strategy_params.initial_cash:,.2f}",
+                        channel=hb_channel or self.strategy_params.serverchan_channel
+                    )
+                except Exception:
+                    pass
+            except Exception as e:
+                print(f"发送启动通知失败: {str(e)}")
+            # 按需：启动即发送一次“每日交易总结”，便于确认渠道和格式
+            try:
+                if getattr(self.strategy_params, 'send_daily_summary_on_start', True):
+                    self._send_daily_summary()
+            except Exception:
+                pass
 
     def stop(self):
         """停止监控"""
@@ -5788,16 +5918,17 @@ class SimpleTradingMonitor:
     def _send_startup_notification(self):
         """发送启动通知"""
         if self.notifier and self.is_running:
-            startup_msg = f"""
-    🚀 量化交易系统启动
-    ━━━━━━━━━━━━━━━
-    📊 标的: {self.strategy_params.symbol}
-    💰 初始资金: ${self.strategy_params.initial_cash:,.0f}
-    ⏰ 启动时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}
-    📈 策略类型: 高风险高回报
-    ━━━━━━━━━━━━━━━
-    系统开始实时监控...
-    """
+            # 去除前导空白的多行字符串，避免企业微信显示缩进空格
+            startup_msg = "\n".join([
+                "🚀 量化交易系统启动",
+                "━━━━━━━━━━━━━━━",
+                f"📊 标的: {self.strategy_params.symbol}",
+                f"💰 初始资金: ${self.strategy_params.initial_cash:,.0f}",
+                f"⏰ 启动时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                "📈 策略类型: 高风险高回报",
+                "━━━━━━━━━━━━━━━",
+                "系统开始实时监控..."
+            ])
             self.notifier.send_message("交易系统启动", startup_msg)
 
     def _send_daily_summary(self):
@@ -5814,17 +5945,65 @@ class SimpleTradingMonitor:
             daily_pnl = portfolio_value - getattr(self, '_last_portfolio_value', portfolio_value)
             daily_pnl_pct = daily_pnl / getattr(self, '_last_portfolio_value', portfolio_value) * 100
             
-            summary_msg = f"""
-                        📊 每日交易总结
-                        ━━━━━━━━━━━━━━━
-                        📅 日期: {datetime.datetime.now().strftime('%Y-%m-%d')}
-                        💼 账户价值: ${portfolio_value:,.2f}
-                        💵 可用现金: ${cash:,.2f}
-                        📈 持仓数量: {position}股
-                        ━━━━━━━━━━━━━━━
-                        📊 当日盈亏: ${daily_pnl:+,.2f} ({daily_pnl_pct:+.1f}%)
-                        ━━━━━━━━━━━━━━━
-                        """
+            # === KISS: 生成“去年今日-今天”的高保真可视化图（直接调用TradeVisualizer），并上传到 imgbb ===
+            chart_url = ""
+            backtest_stats = None
+            try:
+                # 时间范围
+                tz = ZoneInfo("Asia/Shanghai")
+                end_dt = datetime.datetime.now(tz)
+                start_dt = end_dt - datetime.timedelta(days=365)
+                start_str = start_dt.strftime('%Y-%m-%d')
+                end_str = end_dt.strftime('%Y-%m-%d')
+                print(f"[每日总结] 回测区间: {start_str} ~ {end_str}")
+
+                # 直接用TradeVisualizer生成高保真图（与回测模式一致）
+                out_png, stats_obj = generate_backtest_visual_png(
+                    symbol=self.strategy_params.symbol,
+                    start_str=start_str,
+                    end_str=end_str,
+                    interval=self.strategy_params.data_interval or '1h',
+                    # 使用summary_backtest_initial_cash，保证有足够资金触发策略交易，从而产生买卖点
+                    initial_cash=getattr(self.strategy_params, 'summary_backtest_initial_cash', 100000.0),
+                    include_prepost=False
+                )
+                if out_png and os.path.exists(out_png):
+                    print(f"[每日总结] 文件是否存在: True -> {out_png}")
+                    print("[每日总结] 上传图像至 imgbb ...")
+                    chart_url = upload_image_imgbb(out_png, api_key=self.strategy_params.imgbb_api_key)
+                    if chart_url:
+                        print(f"[每日总结] 上传成功: {chart_url}")
+                    else:
+                        print("[每日总结] 上传失败：未获得URL（请检查imgbb_api_key或配额）")
+                else:
+                    print("[每日总结] 未生成PNG（可能缺少kaleido），降级为简易统计，不附图")
+            except Exception as e:
+                print(f"[每日总结] 回测图与上传流程异常: {str(e)}")
+                chart_url = ""
+
+            # 去除多余空格的整洁消息体
+            lines = [
+                "📊 每日交易总结",
+                "━━━━━━━━━━━━━━━",
+                f"📅 日期: {datetime.datetime.now().strftime('%Y-%m-%d')}",
+                f"💼 账户价值: ${portfolio_value:,.2f}",
+                f"💵 可用现金: ${cash:,.2f}",
+                f"📈 持仓数量: {position}股",
+                "━━━━━━━━━━━━━━━",
+                f"📊 当日盈亏: ${daily_pnl:+,.2f} ({daily_pnl_pct:+.1f}%)",
+                "━━━━━━━━━━━━━━━",
+            ]
+            # 附加：简要回测统计（去年今日-今天）
+            if backtest_stats is not None:
+                lines.extend([
+                    f"简易回测区间: { (datetime.datetime.now()-datetime.timedelta(days=365)).strftime('%Y-%m-%d') } ~ {datetime.datetime.now().strftime('%Y-%m-%d') }",
+                    f"初始资金: ${self.strategy_params.initial_cash:,.2f}",
+                    f"最终资金: ${backtest_stats['最终价值']:,.2f}",
+                    f"总收益率: {backtest_stats['收益率']:.2f}%",
+                ])
+            if chart_url:
+                lines.append(f"简易回测K线图: {chart_url} 请复制链接到默认浏览器打开。")
+            summary_msg = "\n".join(lines)
             # 每日总结仅通过企业微信发送，避免服务号打扰
             self.notifier.send_message_wecom("每日交易总结", summary_msg)
             self._last_portfolio_value = portfolio_value
@@ -5836,7 +6015,8 @@ class SimpleTradingMonitor:
         # 等待策略初始化
         init_wait_count = 0
         while not hasattr(self, 'strategy') or self.strategy is None:
-            time.sleep(1)
+            # KISS加速时钟：初始化等待使用time_scale
+            time.sleep(1 / max(1.0, float(getattr(self.strategy_params, 'time_scale', 1.0))))
             init_wait_count += 1
             if init_wait_count > 10:
                 print("策略初始化超时")
@@ -5938,7 +6118,8 @@ class SimpleTradingMonitor:
                 else:
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 等待策略初始化...")
 
-                time.sleep(check_interval)
+                # KISS加速时钟：监控循环节拍受time_scale影响
+                time.sleep(max(0.1, check_interval / max(1.0, float(getattr(self.strategy_params, 'time_scale', 1.0)))))
 
             except Exception as e:
                 error_count += 1
@@ -6603,7 +6784,8 @@ def main():
                 monitor.strategy = strategy
                 # 延迟启动监控，确保策略完全初始化
                 def delayed_monitor_start():
-                    time.sleep(2)  # 等待2秒
+                    # KISS加速时钟：启动延迟使用time_scale
+                    time.sleep(2 / max(1.0, float(getattr(trading_params, 'time_scale', 1.0))))
                     # 不能直接用 if monitor.strategy，因为backtrader重载了__bool__
                     if hasattr(monitor, 'strategy') and monitor.strategy is not None:
                         monitor.start()
@@ -6663,13 +6845,16 @@ def main():
                                     except Exception:
                                         pass
 
-                                # Server酱：每小时一次
+                                # Server酱：每小时一次（仅服务号，不再连带企业微信）
                                 if getattr(trading_params, 'enable_serverchan_hourly_heartbeat', True):
                                     sc_interval = int(getattr(trading_params, 'serverchan_heartbeat_seconds', 3600))
                                     if (now - last_serverchan_hb).total_seconds() >= sc_interval:
+                                        # 使用心跳专用渠道覆盖，只发服务号，避免企业微信收到小时心跳
+                                        hb_channel = getattr(trading_params, 'serverchan_heartbeat_channel', '')
                                         notifier.send_message_serverchan(
                                             "系统心跳",
-                                            f"{status_msg}\n{extra}"
+                                            f"{status_msg}\n{extra}",
+                                            channel=hb_channel
                                         )
                                         last_serverchan_hb = now
 
@@ -6682,21 +6867,35 @@ def main():
                                         target_m = int(getattr(trading_params, 'wecom_daily_heartbeat_minute_local', 15))
                                         if (now_cst.hour == target_h and now_cst.minute >= target_m):
                                             if last_wecom_hb_date != now_cst.date():
-                                                notifier.send_message_wecom(
-                                                    "系统心跳（日更）",
-                                                    f"{status_msg}\n{extra}"
-                                                )
+                                                # 改为发送“每日交易总结”到企业微信
+                                                try:
+                                                    if monitor:
+                                                        monitor._send_daily_summary()
+                                                    else:
+                                                        notifier.send_message_wecom("每日交易总结", f"{status_msg}\n{extra}")
+                                                except Exception:
+                                                    notifier.send_message_wecom("每日交易总结", f"{status_msg}\n{extra}")
                                                 last_wecom_hb_date = now_cst.date()
                                     except Exception:
                                         pass
                             last_status_time = now
 
-                        time.sleep(60)  # 每分钟检查一次
+                        # 外部健康检查心跳（轻量、异常忽略）
+                        try:
+                            ping_url = getattr(trading_params, 'healthcheck_ping_url', '')
+                            if ping_url:
+                                requests.get(ping_url, timeout=5)
+                        except Exception:
+                            pass
+
+                        # KISS加速时钟：主循环步进为60秒/scale
+                        time.sleep(max(0.1, 60 / max(1.0, float(getattr(trading_params, 'time_scale', 1.0)))))
 
                     except KeyboardInterrupt:
                         raise  # 向上传递中断信号
                     except Exception as e:
                         print(f"主循环错误: {str(e)}")
+                        # 错误后等待保留真实间隔，避免重试风暴
                         time.sleep(60)
 
         except KeyboardInterrupt:
@@ -6722,10 +6921,23 @@ def main():
                 if monitor:
                     monitor.stop()
                 if notifier:
-                    notifier.send_message(
-                        "实时交易系统停止",
-                        "系统已安全关闭"
-                    )
+                    try:
+                        notifier.send_message(
+                            "实时交易系统停止",
+                            "系统已安全关闭"
+                        )
+                    except Exception:
+                        pass
+                    # 同步向Server酱发送后台停止通知
+                    try:
+                        hb_channel = getattr(trading_params, 'serverchan_heartbeat_channel', '')
+                        notifier.send_message_serverchan(
+                            "实时交易系统停止",
+                            "系统已安全关闭",
+                            channel=hb_channel or trading_params.serverchan_channel
+                        )
+                    except Exception:
+                        pass
 
                 # 生成历史回测报告
                 if trading_params.generate_live_report:
