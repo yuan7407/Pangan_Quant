@@ -2,6 +2,7 @@ numpy>=1.24
 pandas>=2.0
 matplotlib>=3.8
 plotly>=5.18
+kaleido>=0.2.1
 backtrader==1.9.78.123
 tzdata>=2024.1
 pandas-market-calendars>=4.4.1
