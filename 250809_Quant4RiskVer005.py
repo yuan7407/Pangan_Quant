@@ -69,7 +69,18 @@ def generate_backtest_visual_png(symbol: str,
     """
     try:
         print(f"[每日总结] 回测(可视化) - 下载 {symbol} {interval} 数据: {start_str} ~ {end_str}")
-        df = yfinance_download(symbol=symbol, start=start_str, end=end_str, interval=interval, prepost=include_prepost)
+        # 优先使用 YFinance，失败时回退到 Twelve Data，避免因限流导致不可视化
+        try:
+            df = yfinance_download(symbol=symbol, start=start_str, end=end_str, interval=interval, prepost=include_prepost)
+        except Exception as e1:
+            print(f"[每日总结] YFinance 获取失败: {str(e1)}，尝试 Twelve Data ...")
+            try:
+                # 使用环境变量 TWELVE_DATA_API_KEY，若无则用 demo key（功能有限）
+                api_key = os.environ.get("TWELVE_DATA_API_KEY") or "4e06770f76fe42b9bc3b6760b14118f6"
+                df = twelvedata_download(symbol=symbol, start=start_str, end=end_str, interval=interval, api_key=api_key)
+            except Exception as e2:
+                print(f"[每日总结] 可视化回测失败: YF限流/错误与 Twelve Data 失败: {str(e2)}")
+                return "", None
         # 兼容列名：统一到小写，日期列命名为 'date'
         rename_map = {c: c.lower() for c in df.columns}
         df = df.rename(columns=rename_map)
@@ -136,7 +147,9 @@ def generate_backtest_visual_png(symbol: str,
             print("[每日总结] 使用TradeVisualizer+kaleido导出PNG成功")
             return out_png, stats
         except Exception as e:
-            print("[每日总结] 需安装kaleido以导出高保真图像：pip install -U kaleido")
+            # 明确区分 kaleido 缺失与其他错误
+            if "kaleido" in str(e).lower():
+                print("[每日总结] 需安装kaleido以导出高保真图像：pip install -U kaleido")
             print(f"[每日总结] 导出失败: {str(e)}")
             return "", stats
     except Exception as e:
@@ -6354,7 +6367,7 @@ def main():
         if live_mode:
             # 实时模式：先获取历史数据，再创建数据源
             print(f"\n获取 {symbol} 的历史数据...")
-            api_sources = [
+            api_sources_all = [
                 ("YFinance", lambda: yfinance_download(
                     symbol=trading_params.symbol,
                     start=trading_params.start_date,
@@ -6367,9 +6380,14 @@ def main():
                     start=trading_params.start_date,
                     end=trading_params.end_date,
                     interval=interval_input,
-                    api_key='4e06770f76fe42b9bc3b6760b14118f6'
+                    api_key=(os.environ.get("TWELVE_DATA_API_KEY") or '4e06770f76fe42b9bc3b6760b14118f6')
                 ))
             ]
+            # 按用户选择重排优先级："2" 则 Twelve Data 优先
+            if provider_choice == "2":
+                api_sources = [api_sources_all[1], api_sources_all[0]]
+            else:
+                api_sources = api_sources_all
 
             # 尝试获取历史数据
             successful_source = None
