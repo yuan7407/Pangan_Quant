@@ -62,25 +62,46 @@ def generate_backtest_visual_png(symbol: str,
                                  end_str: str,
                                  interval: str,
                                  initial_cash: float,
-                                 include_prepost: bool = True) -> tuple:
+                                 include_prepost: bool = True,
+                                 preferred_provider: str = "") -> tuple:
     """运行一次轻量回测，使用TradeVisualizer生成高保真PNG。
     返回 (png_path, stats_dict)。若失败，返回("", None)。
     说明：需要kaleido方可输出Plotly PNG；若缺失会在日志提示。
     """
     try:
         print(f"[每日总结] 回测(可视化) - 下载 {symbol} {interval} 数据: {start_str} ~ {end_str}")
-        # 优先使用 YFinance，失败时回退到 Twelve Data，避免因限流导致不可视化
-        try:
-            df = yfinance_download(symbol=symbol, start=start_str, end=end_str, interval=interval, prepost=include_prepost)
-        except Exception as e1:
-            print(f"[每日总结] YFinance 获取失败: {str(e1)}，尝试 Twelve Data ...")
+        # 根据偏好决定优先顺序
+        sources = []
+        if preferred_provider and preferred_provider.lower().startswith("twelve"):
+            sources = [
+                ("Twelve Data", lambda: twelvedata_download(symbol=symbol, start=start_str, end=end_str, interval=interval, api_key=(os.environ.get("TWELVE_DATA_API_KEY") or "4e06770f76fe42b9bc3b6760b14118f6"))),
+                ("YFinance", lambda: yfinance_download(symbol=symbol, start=start_str, end=end_str, interval=interval, prepost=include_prepost)),
+            ]
+        elif preferred_provider and preferred_provider.lower().startswith("yfinance"):
+            sources = [
+                ("YFinance", lambda: yfinance_download(symbol=symbol, start=start_str, end=end_str, interval=interval, prepost=include_prepost)),
+                ("Twelve Data", lambda: twelvedata_download(symbol=symbol, start=start_str, end=end_str, interval=interval, api_key=(os.environ.get("TWELVE_DATA_API_KEY") or "4e06770f76fe42b9bc3b6760b14118f6"))),
+            ]
+        else:
+            sources = [
+                ("YFinance", lambda: yfinance_download(symbol=symbol, start=start_str, end=end_str, interval=interval, prepost=include_prepost)),
+                ("Twelve Data", lambda: twelvedata_download(symbol=symbol, start=start_str, end=end_str, interval=interval, api_key=(os.environ.get("TWELVE_DATA_API_KEY") or "4e06770f76fe42b9bc3b6760b14118f6"))),
+            ]
+
+        df = None
+        last_err = None
+        for name, fn in sources:
             try:
-                # 使用环境变量 TWELVE_DATA_API_KEY，若无则用 demo key（功能有限）
-                api_key = os.environ.get("TWELVE_DATA_API_KEY") or "4e06770f76fe42b9bc3b6760b14118f6"
-                df = twelvedata_download(symbol=symbol, start=start_str, end=end_str, interval=interval, api_key=api_key)
-            except Exception as e2:
-                print(f"[每日总结] 可视化回测失败: YF限流/错误与 Twelve Data 失败: {str(e2)}")
-                return "", None
+                df = fn()
+                if df is not None and not df.empty:
+                    break
+            except Exception as _e:
+                print(f"[每日总结] {name} 获取失败: {str(_e)}")
+                last_err = _e
+                continue
+        if df is None or df.empty:
+            print(f"[每日总结] 可视化回测失败: 所有数据源均失败: {last_err}")
+            return "", None
         # 兼容列名：统一到小写，日期列命名为 'date'
         rename_map = {c: c.lower() for c in df.columns}
         df = df.rename(columns=rename_map)
@@ -132,8 +153,8 @@ def generate_backtest_visual_png(symbol: str,
 
         viz = TradeVisualizer(df=df.copy(), strategy=strategy, stats=stats, symbol=symbol, initial_cash=initial_cash, buy_hold_stats=buy_hold)
         fig = viz.create_candlestick_chart()
-        # 提高分辨率（导出像素）
-        fig.update_layout(width=1920, height=1080)
+        # 提高分辨率与可读性（更接近常规回测图）
+        fig.update_layout(width=2560, height=1440)
         # 将图片输出到 logs/daily_summary_screenshots
         out_dir = os.path.join(os.getcwd(), 'logs', 'daily_summary_screenshots')
         try:
@@ -142,8 +163,8 @@ def generate_backtest_visual_png(symbol: str,
             pass
         out_png = os.path.join(out_dir, f"summary_{symbol}_{end_str}.png")
         try:
-            # 使用scale放大，获得更高像素的导出
-            fig.write_image(out_png, format='png', scale=2)
+            # 使用适中scale，避免过大文件但保持清晰
+            fig.write_image(out_png, format='png', scale=1.5)
             print("[每日总结] 使用TradeVisualizer+kaleido导出PNG成功")
             return out_png, stats
         except Exception as e:
@@ -5980,7 +6001,8 @@ class SimpleTradingMonitor:
                     interval=self.strategy_params.data_interval or '1h',
                     # 使用summary_backtest_initial_cash，保证有足够资金触发策略交易，从而产生买卖点
                     initial_cash=getattr(self.strategy_params, 'summary_backtest_initial_cash', 100000.0),
-                    include_prepost=False
+                    include_prepost=False,
+                    preferred_provider=("Twelve Data" if getattr(self.strategy_params, 'data_interval', '1h') else "")
                 )
                 if out_png and os.path.exists(out_png):
                     print(f"[每日总结] 文件是否存在: True -> {out_png}")
