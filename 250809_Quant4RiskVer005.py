@@ -3,8 +3,7 @@
 250809_Quant4RiskVer005.py
 基于 市场趋势判断，结合均线、MACD、RSI和成交量分析的高风险高回报量化交易策略，通过server酱推送通知到绑定微信上。
 作者：Michael Yuan
-
-2508161539
+2508161604更新
 """
 
 import datetime
@@ -490,9 +489,6 @@ class TradingParameters:
 
     # 实时运行日志节流
     enable_periodic_signal_log: bool = False   # 是否定期打印信号检查（默认关闭）
-
-    # 数据源偏好（"YFinance" 或 "Twelve Data"；空表示自动）
-    preferred_data_provider: str = ""
     enable_periodic_account_log: bool = False  # 是否定期打印账户状态（默认关闭）
     periodic_log_interval_bars: int = 100      # 定期打印的bar间隔
 
@@ -6005,7 +6001,7 @@ class SimpleTradingMonitor:
                     # 使用summary_backtest_initial_cash，保证有足够资金触发策略交易，从而产生买卖点
                     initial_cash=getattr(self.strategy_params, 'summary_backtest_initial_cash', 100000.0),
                     include_prepost=False,
-                    preferred_provider=(getattr(self.strategy_params, 'preferred_data_provider', "") or ("Twelve Data" if getattr(self.strategy_params, 'data_interval', '1h') else ""))
+                    preferred_provider=("Twelve Data" if getattr(self.strategy_params, 'data_interval', '1h') else "")
                 )
                 if out_png and os.path.exists(out_png):
                     print(f"[每日总结] 文件是否存在: True -> {out_png}")
