@@ -3,7 +3,8 @@
 250809_Quant4RiskVer005.py
 基于 市场趋势判断，结合均线、MACD、RSI和成交量分析的高风险高回报量化交易策略，通过server酱推送通知到绑定微信上。
 作者：Michael Yuan
-2508161500
+
+2508161539
 """
 
 import datetime
