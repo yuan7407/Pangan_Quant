@@ -374,7 +374,7 @@ class TradingParameters:
 
     serverchan_sendkey: str = "SCT119824TW3DsGlBjkhAV9lJWIOLohv1P"  # Server酱的SendKey
     # 新增：企业微信群机器人 & Server酱渠道
-    wecom_webhook_url: str = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=dd52bd7c-a8a2-4406-8332-714faaa3185e"
+    wecom_webhook_url: str = ""
     serverchan_channel: str = "9|1"  # 例如 "9|1" 同时服务号与企业微信群机器人
     enable_trade_notification: bool = True  # 是否启用交易通知
     enable_risk_notification: bool = True   # 是否启用风险提醒
@@ -6319,6 +6319,11 @@ def main():
 
 
         serverchan_key = "SCT119824TW3DsGlBjkhAV9lJWIOLohv1P"
+        # 实时模式下，允许外部输入企业微信Webhook，便于多进程、多标的分别推送
+        wecom_url_input = ""
+        if live_mode:
+            print("\n如需企业微信机器人推送，请粘贴Webhook URL（留空则仅使用Server酱服务号）")
+            wecom_url_input = input("粘贴企业微信Webhook URL（可留空）: ").strip()
 
         # API 密钥（仅保留 Twelve Data）
         TWELVE_DATA_API_KEY = "4e06770f76fe42b9bc3b6760b14118f6"
@@ -6367,7 +6372,8 @@ def main():
             generate_live_report=generate_live_report,
             exclude_premarket=not include_prepost,
             exclude_afterhours=not include_prepost,
-            prepost=include_prepost
+            prepost=include_prepost,
+            wecom_webhook_url=wecom_url_input
         )
         trading_params.validate()
 
